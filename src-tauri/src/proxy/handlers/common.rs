@@ -92,6 +92,10 @@ pub fn determine_retry_strategy(
     }
 }
 
+pub fn has_retry_attempt_remaining(attempt: usize, max_attempts: usize) -> bool {
+    attempt.saturating_add(1) < max_attempts
+}
+
 /// 执行退避策略并返回是否应该继续重试
 pub async fn apply_retry_strategy(
     strategy: RetryStrategy,
@@ -100,6 +104,16 @@ pub async fn apply_retry_strategy(
     status_code: u16,
     trace_id: &str,
 ) -> bool {
+    if !has_retry_attempt_remaining(attempt, max_attempts) {
+        debug!(
+            "[{}] No retry slot remains after attempt {}/{}, returning immediately",
+            trace_id,
+            attempt + 1,
+            max_attempts
+        );
+        return false;
+    }
+
     match strategy {
         RetryStrategy::NoRetry => {
             debug!(

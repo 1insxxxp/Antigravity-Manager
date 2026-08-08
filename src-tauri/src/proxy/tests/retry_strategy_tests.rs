@@ -2,7 +2,7 @@
 //! 重点覆盖 404 重试与账号轮换逻辑。
 
 use crate::proxy::handlers::common::{
-    determine_retry_strategy, should_rotate_account, RetryStrategy,
+    determine_retry_strategy, has_retry_attempt_remaining, should_rotate_account, RetryStrategy,
 };
 use std::time::Duration;
 
@@ -121,6 +121,14 @@ fn test_retry_strategy_400_no_signature() {
         "Expected NoRetry for 400 without signature, got {:?}",
         strategy
     );
+}
+
+#[test]
+fn final_attempt_has_no_retry_slot() {
+    assert!(has_retry_attempt_remaining(0, 3));
+    assert!(has_retry_attempt_remaining(1, 3));
+    assert!(!has_retry_attempt_remaining(2, 3));
+    assert!(!has_retry_attempt_remaining(0, 0));
 }
 
 // ===== should_rotate_account =====
