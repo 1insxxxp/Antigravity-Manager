@@ -843,7 +843,7 @@ pub async fn handle_generate(
                 token_manager
                     .mark_rate_limited_async(
                         &email,
-                        status_code,
+                        failure.status,
                         retry_after.as_deref(),
                         &failure.sanitized_error,
                         Some(&config.final_model),

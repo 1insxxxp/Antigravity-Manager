@@ -1,9 +1,11 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde_json::Value;
 use std::collections::HashSet;
 
 const MAX_ACCOUNT_ATTEMPTS: usize = 10;
 const MAX_SANITIZED_ERROR_CHARS: usize = 1_024;
+const MAX_EMBEDDED_ERROR_DEPTH: usize = 8;
 
 static REQUEST_BODY_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)\b(request\s+(?:body|payload))\s*[:=].*$")
@@ -193,7 +195,7 @@ pub fn classify_pool_failure(
         PoolFailureScope::AccountAuth
     } else if matches!(status, 429 | 503) && is_provider_model_failure(&normalized) {
         PoolFailureScope::ProviderModel
-    } else if status == 429 {
+    } else if status == 429 || is_embedded_account_model_failure(error_text) {
         PoolFailureScope::AccountModel
     } else {
         PoolFailureScope::Unknown
@@ -208,10 +210,10 @@ pub fn classify_pool_failure(
         | PoolFailureScope::Unknown => RetryDisposition::Return,
     };
 
-    let terminal_status = if scope == PoolFailureScope::ProviderModel && status == 429 {
-        503
-    } else {
-        status
+    let terminal_status = match scope {
+        PoolFailureScope::ProviderModel if status == 429 => 503,
+        PoolFailureScope::AccountModel => 429,
+        _ => status,
     };
 
     PoolFailure {
@@ -323,6 +325,60 @@ fn is_account_auth_failure(normalized: &str) -> bool {
 fn is_provider_model_failure(normalized: &str) -> bool {
     normalized.contains("no capacity available for model")
         || normalized.contains("model_capacity_exhausted")
+}
+
+fn is_embedded_account_model_failure(error_text: &str) -> bool {
+    serde_json::from_str::<Value>(error_text)
+        .ok()
+        .is_some_and(|value| embedded_account_model_failure(&value, 0))
+}
+
+fn embedded_account_model_failure(value: &Value, depth: usize) -> bool {
+    if depth > MAX_EMBEDDED_ERROR_DEPTH {
+        return false;
+    }
+
+    match value {
+        Value::Object(object) => {
+            let code_is_429 = object
+                .get("code")
+                .is_some_and(|code| code.as_u64() == Some(429) || code.as_str() == Some("429"));
+            let resource_exhausted = object
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("RESOURCE_EXHAUSTED"));
+
+            (code_is_429 && resource_exhausted && contains_account_quota_marker(value))
+                || object
+                    .values()
+                    .any(|child| embedded_account_model_failure(child, depth + 1))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|child| embedded_account_model_failure(child, depth + 1)),
+        Value::String(encoded_json) => serde_json::from_str::<Value>(encoded_json)
+            .ok()
+            .is_some_and(|decoded| embedded_account_model_failure(&decoded, depth + 1)),
+        _ => false,
+    }
+}
+
+fn contains_account_quota_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("quotaResetDelay"))
+                || object.values().any(contains_account_quota_marker)
+        }
+        Value::Array(values) => values.iter().any(contains_account_quota_marker),
+        Value::String(text) => {
+            let normalized = text.to_ascii_lowercase();
+            normalized.contains("quota_exhausted")
+                || normalized.contains("you have exhausted your capacity on this model")
+        }
+        _ => false,
+    }
 }
 
 fn is_permanent_account_auth_failure(normalized: &str) -> bool {
@@ -442,6 +498,34 @@ mod tests {
         assert_eq!(failure.disposition, RetryDisposition::RotateAccount);
         assert!(failure.should_cooldown_account());
         assert_eq!(failure.retry_after.as_deref(), Some("17998"));
+    }
+
+    #[test]
+    fn nested_account_quota_429_inside_http_400_rotates_and_cools_model() {
+        let failure = classify_pool_failure(
+            400,
+            r#"{"error":{"code":400,"message":"{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{\"reason\":\"QUOTA_EXHAUSTED\",\"metadata\":{\"quotaResetDelay\":\"4h59m58s\"}}]}}"}}"#,
+            None,
+        );
+
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.scope, PoolFailureScope::AccountModel);
+        assert_eq!(failure.disposition, RetryDisposition::RotateAccount);
+        assert!(failure.should_cooldown_account());
+    }
+
+    #[test]
+    fn ordinary_http_400_that_mentions_quota_fields_is_not_an_account_limit() {
+        let failure = classify_pool_failure(
+            400,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"The quotaResetDelay and QUOTA_EXHAUSTED fields are not allowed here"}}"#,
+            None,
+        );
+
+        assert_eq!(failure.status, 400);
+        assert_eq!(failure.scope, PoolFailureScope::Unknown);
+        assert_eq!(failure.disposition, RetryDisposition::Return);
+        assert!(!failure.should_cooldown_account());
     }
 
     #[test]
