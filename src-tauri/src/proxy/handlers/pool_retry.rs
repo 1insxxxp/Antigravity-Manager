@@ -38,6 +38,8 @@ pub enum RetryDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiRetryAction {
     CooldownAndRotate,
+    CooldownAndReturn,
+    RotateAccount,
     ReturnProviderStatus,
     ReturnFailure,
 }
@@ -45,6 +47,7 @@ pub enum GeminiRetryAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiRetryAction {
     CooldownAndRotate,
+    CooldownAndReturn,
     ReturnProviderStatus,
     ReturnFailure,
 }
@@ -52,6 +55,7 @@ pub enum OpenAiRetryAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeRetryAction {
     CooldownAndRotate,
+    CooldownAndReturn,
     ReturnProviderStatus,
     ReturnFailure,
 }
@@ -180,7 +184,7 @@ pub fn classify_pool_failure(
     let normalized = error_text.to_ascii_lowercase();
     let scope = if matches!(status, 401 | 403) || is_account_auth_failure(&normalized) {
         PoolFailureScope::AccountAuth
-    } else if status == 429 && is_account_model_failure(&normalized) {
+    } else if status == 429 {
         PoolFailureScope::AccountModel
     } else if status == 503 && is_provider_model_failure(&normalized) {
         PoolFailureScope::ProviderModel
@@ -216,11 +220,14 @@ pub fn gemini_retry_action(
         {
             GeminiRetryAction::CooldownAndRotate
         }
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel => {
+            GeminiRetryAction::CooldownAndReturn
+        }
+        PoolFailureScope::Transport if remaining_account_attempts > 0 => {
+            GeminiRetryAction::RotateAccount
+        }
         PoolFailureScope::ProviderModel => GeminiRetryAction::ReturnProviderStatus,
-        PoolFailureScope::AccountAuth
-        | PoolFailureScope::AccountModel
-        | PoolFailureScope::Transport
-        | PoolFailureScope::Unknown => GeminiRetryAction::ReturnFailure,
+        PoolFailureScope::Transport | PoolFailureScope::Unknown => GeminiRetryAction::ReturnFailure,
     }
 }
 
@@ -234,11 +241,11 @@ pub fn openai_retry_action(
         {
             OpenAiRetryAction::CooldownAndRotate
         }
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel => {
+            OpenAiRetryAction::CooldownAndReturn
+        }
         PoolFailureScope::ProviderModel => OpenAiRetryAction::ReturnProviderStatus,
-        PoolFailureScope::AccountAuth
-        | PoolFailureScope::AccountModel
-        | PoolFailureScope::Transport
-        | PoolFailureScope::Unknown => OpenAiRetryAction::ReturnFailure,
+        PoolFailureScope::Transport | PoolFailureScope::Unknown => OpenAiRetryAction::ReturnFailure,
     }
 }
 
@@ -252,11 +259,11 @@ pub fn claude_retry_action(
         {
             ClaudeRetryAction::CooldownAndRotate
         }
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel => {
+            ClaudeRetryAction::CooldownAndReturn
+        }
         PoolFailureScope::ProviderModel => ClaudeRetryAction::ReturnProviderStatus,
-        PoolFailureScope::AccountAuth
-        | PoolFailureScope::AccountModel
-        | PoolFailureScope::Transport
-        | PoolFailureScope::Unknown => ClaudeRetryAction::ReturnFailure,
+        PoolFailureScope::Transport | PoolFailureScope::Unknown => ClaudeRetryAction::ReturnFailure,
     }
 }
 
@@ -284,22 +291,6 @@ fn is_account_auth_failure(normalized: &str) -> bool {
         "insufficient permissions",
         "account suspended",
         "account disabled",
-    ];
-
-    MARKERS.iter().any(|marker| normalized.contains(marker))
-}
-
-fn is_account_model_failure(normalized: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "quota",
-        "rate limit",
-        "rate_limit",
-        "resource exhausted",
-        "resource_exhausted",
-        "capacity on this model",
-        "account capacity",
-        "reset after",
-        "retry after",
     ];
 
     MARKERS.iter().any(|marker| normalized.contains(marker))
@@ -369,6 +360,17 @@ mod tests {
     }
 
     #[test]
+    fn bare_429_is_treated_as_an_account_model_limit() {
+        for error_text in ["", "Too Many Requests"] {
+            let failure = classify_pool_failure(429, error_text, Some("60"));
+
+            assert_eq!(failure.scope, PoolFailureScope::AccountModel);
+            assert_eq!(failure.disposition, RetryDisposition::RotateAccount);
+            assert_eq!(failure.retry_after.as_deref(), Some("60"));
+        }
+    }
+
+    #[test]
     fn gemini_account_429_marks_and_rotates() {
         let failure = classify_pool_failure(429, "quota will reset after 4h", None);
 
@@ -414,7 +416,35 @@ mod tests {
 
         assert_eq!(
             openai_retry_action(&failure, 0),
-            OpenAiRetryAction::ReturnFailure
+            OpenAiRetryAction::CooldownAndReturn
+        );
+    }
+
+    #[test]
+    fn terminal_account_failures_still_update_account_state() {
+        let failure = classify_pool_failure(429, "quota will reset after 4h", None);
+
+        assert_eq!(
+            gemini_retry_action(&failure, 0),
+            GeminiRetryAction::CooldownAndReturn
+        );
+        assert_eq!(
+            openai_retry_action(&failure, 0),
+            OpenAiRetryAction::CooldownAndReturn
+        );
+        assert_eq!(
+            claude_retry_action(&failure, 0),
+            ClaudeRetryAction::CooldownAndReturn
+        );
+    }
+
+    #[test]
+    fn gemini_rotates_after_same_account_transport_retry_is_spent() {
+        let failure = PoolFailure::transport("connection reset by peer");
+
+        assert_eq!(
+            gemini_retry_action(&failure, 1),
+            GeminiRetryAction::RotateAccount
         );
     }
 

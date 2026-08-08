@@ -1257,6 +1257,13 @@ impl TokenManager {
             return Err("Token pool is empty".to_string());
         }
 
+        let now = chrono::Utc::now().timestamp();
+        tokens_snapshot
+            .retain(|token| !token.validation_blocked || token.validation_blocked_until <= now);
+        if tokens_snapshot.is_empty() {
+            return Err("All accounts are temporarily validation-blocked".to_string());
+        }
+
         if let Some(session_id) = session_id {
             let binding_is_excluded = self
                 .session_accounts
@@ -2183,6 +2190,42 @@ impl TokenManager {
 
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+
+    pub async fn eligible_account_count(&self, target_model: &str) -> usize {
+        let normalized_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+        let quota_protection_enabled = crate::modules::config::load_app_config()
+            .map(|config| config.quota_protection.enabled)
+            .unwrap_or(false);
+        let now = chrono::Utc::now().timestamp();
+        let candidates: Vec<(String, bool)> = self
+            .tokens
+            .iter()
+            .filter(|entry| entry.model_quotas.contains_key(&normalized_target))
+            .filter(|entry| !entry.validation_blocked || entry.validation_blocked_until <= now)
+            .map(|entry| {
+                (
+                    entry.account_id.clone(),
+                    entry.protected_models.contains(&normalized_target),
+                )
+            })
+            .collect();
+
+        let mut eligible = 0;
+        for (account_id, is_protected) in candidates {
+            if quota_protection_enabled && is_protected {
+                continue;
+            }
+            if !self
+                .is_rate_limited(&account_id, Some(&normalized_target))
+                .await
+            {
+                eligible += 1;
+            }
+        }
+        eligible
     }
 
     /// 通过 email 获取指定账号的 Token（用于预热等需要指定账号的场景）
@@ -3352,6 +3395,46 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("excluded"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
+
+    #[tokio::test]
+    async fn eligible_account_count_is_model_specific() {
+        let (manager, tmp_root) = exclusion_test_manager().await;
+        {
+            let mut token = manager.tokens.get_mut("acc-3").unwrap();
+            token.model_quotas.clear();
+            let flash_model =
+                crate::proxy::common::model_mapping::normalize_to_standard_id("gemini-2.5-flash")
+                    .unwrap_or_else(|| "gemini-2.5-flash".to_string());
+            token.model_quotas.insert(flash_model, 80);
+        }
+
+        assert_eq!(manager.eligible_account_count("gemini-2.5-pro").await, 2);
+        assert_eq!(manager.eligible_account_count("gemini-2.5-flash").await, 1);
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
+
+    #[tokio::test]
+    async fn validation_blocked_account_is_not_eligible_for_selection() {
+        let (manager, tmp_root) = exclusion_test_manager().await;
+        manager
+            .set_validation_block(
+                "acc-1",
+                chrono::Utc::now().timestamp() + 600,
+                "Verify your account to continue.",
+            )
+            .await
+            .unwrap();
+        let excluded = HashSet::from(["acc-2".to_string(), "acc-3".to_string()]);
+
+        let error = manager
+            .get_token_excluding("gemini", true, None, "gemini-2.5-pro", &excluded)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("excluded"), "unexpected error: {error}");
+        assert_eq!(manager.eligible_account_count("gemini-2.5-pro").await, 2);
         let _ = std::fs::remove_dir_all(tmp_root);
     }
 

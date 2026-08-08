@@ -834,7 +834,13 @@ pub async fn handle_messages(
     let mut request_for_body = request.clone();
     let token_manager = state.token_manager;
 
-    let pool_size = token_manager.len();
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &request_for_body.model,
+        &*state.custom_mapping.read().await,
+    );
+    let pool_size = token_manager
+        .eligible_account_count(&initial_mapped_model)
+        .await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_attempts = pool_attempts.max_account_attempts().max(1);
 
@@ -1796,40 +1802,54 @@ pub async fn handle_messages(
             "Claude upstream failure classified"
         );
 
-        match claude_retry_action(&failure, remaining) {
+        let action = claude_retry_action(&failure, remaining);
+        if failure.scope == PoolFailureScope::AccountModel {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &failure.sanitized_error,
+                    Some(&request_with_mapped.model),
+                )
+                .await;
+        }
+
+        if failure.scope == PoolFailureScope::AccountAuth {
+            let normalized_error = error_text.to_ascii_lowercase();
+            let requires_validation = normalized_error.contains("validation_required")
+                || normalized_error.contains("verify your account")
+                || normalized_error.contains("validation_url")
+                || normalized_error.contains("validationurl");
+            if requires_validation {
+                let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                if let Err(e) = token_manager
+                    .set_validation_block_public(&account_id, block_until, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set validation block: {}", e);
+                }
+            } else if status_code == 403 {
+                if let Err(e) = token_manager
+                    .set_forbidden(&account_id, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set forbidden status for {}: {}", email, e);
+                }
+            }
+        }
+
+        match action {
             ClaudeRetryAction::CooldownAndRotate => {
-                if failure.scope == PoolFailureScope::AccountModel {
-                    token_manager
-                        .mark_rate_limited_async(
-                            &email,
-                            status_code,
-                            retry_after.as_deref(),
-                            &error_text,
-                            Some(&request_with_mapped.model),
-                        )
-                        .await;
-                }
-
-                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
-                    if error_text.contains("VALIDATION_REQUIRED")
-                        || error_text.contains("verify your account")
-                        || error_text.contains("validation_url")
-                    {
-                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
-                        if let Err(e) = token_manager
-                            .set_validation_block_public(&account_id, block_until, &error_text)
-                            .await
-                        {
-                            tracing::error!("Failed to set validation block: {}", e);
-                        }
-                    }
-                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
-                        tracing::error!("Failed to set forbidden status for {}: {}", email, e);
-                    }
-                }
-
                 force_rotate = true;
                 continue;
+            }
+            ClaudeRetryAction::CooldownAndReturn => {
+                return claude_pool_error_response(
+                    &pool_attempts,
+                    Some(&request_with_mapped.model),
+                    Some(&email),
+                );
             }
             ClaudeRetryAction::ReturnProviderStatus | ClaudeRetryAction::ReturnFailure => {
                 return claude_pool_error_response(

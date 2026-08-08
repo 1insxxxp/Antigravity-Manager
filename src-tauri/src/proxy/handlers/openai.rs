@@ -514,9 +514,6 @@ pub async fn handle_chat_completions(
     // 1. 获取 UpstreamClient (Clone handle)
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
-    let pool_size = token_manager.len();
-    let mut pool_attempts = PoolAttemptState::new(pool_size);
-    let max_attempts = pool_attempts.max_account_attempts().max(1);
     let mut signature_repair_attempted = false;
 
     let mut last_error = String::new();
@@ -527,6 +524,9 @@ pub async fn handle_chat_completions(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
+    let pool_size = token_manager.eligible_account_count(&mapped_model).await;
+    let mut pool_attempts = PoolAttemptState::new(pool_size);
+    let max_attempts = pool_attempts.max_account_attempts().max(1);
 
     // One extra handler pass is reserved for the same-account signature repair.
     // Account traversal is still capped by PoolAttemptState.
@@ -1111,38 +1111,45 @@ pub async fn handle_chat_completions(
             "OpenAI upstream failure classified"
         );
 
-        match openai_retry_action(&failure, remaining) {
+        let action = openai_retry_action(&failure, remaining);
+        if failure.scope == PoolFailureScope::AccountModel {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    _retry_after.as_deref(),
+                    &failure.sanitized_error,
+                    Some(&mapped_model),
+                )
+                .await;
+        }
+
+        if failure.scope == PoolFailureScope::AccountAuth {
+            let normalized_error = error_text.to_ascii_lowercase();
+            let requires_validation = normalized_error.contains("validation_required")
+                || normalized_error.contains("verify your account")
+                || normalized_error.contains("validation_url")
+                || normalized_error.contains("validationurl");
+            if requires_validation {
+                let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                if let Err(e) = token_manager
+                    .set_validation_block_public(&account_id, block_until, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set validation block: {}", e);
+                }
+            } else if status_code == 403 {
+                if let Err(e) = token_manager
+                    .set_forbidden(&account_id, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set forbidden status: {}", e);
+                }
+            }
+        }
+
+        match action {
             OpenAiRetryAction::CooldownAndRotate => {
-                if failure.scope == PoolFailureScope::AccountModel {
-                    token_manager
-                        .mark_rate_limited_async(
-                            &email,
-                            status_code,
-                            _retry_after.as_deref(),
-                            &error_text,
-                            Some(&mapped_model),
-                        )
-                        .await;
-                }
-
-                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
-                    if error_text.contains("VALIDATION_REQUIRED")
-                        || error_text.contains("verify your account")
-                        || error_text.contains("validation_url")
-                    {
-                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
-                        if let Err(e) = token_manager
-                            .set_validation_block_public(&account_id, block_until, &error_text)
-                            .await
-                        {
-                            tracing::error!("Failed to set validation block: {}", e);
-                        }
-                    }
-                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
-                        tracing::error!("Failed to set forbidden status: {}", e);
-                    }
-                }
-
                 if client_adapter
                     .as_ref()
                     .is_some_and(|adapter| adapter.let_it_crash() && attempt > 0)
@@ -1156,6 +1163,13 @@ pub async fn handle_chat_completions(
 
                 force_rotate = true;
                 continue;
+            }
+            OpenAiRetryAction::CooldownAndReturn => {
+                return Ok(openai_pool_error_response(
+                    &pool_attempts,
+                    &mapped_model,
+                    Some(&email),
+                ));
             }
             OpenAiRetryAction::ReturnProviderStatus | OpenAiRetryAction::ReturnFailure => {
                 return Ok(openai_pool_error_response(
@@ -2073,7 +2087,7 @@ pub async fn handle_completions(
         .count();
 
     let upstream = state.upstream.clone();
-    let pool_size = token_manager.len();
+    let pool_size = token_manager.eligible_account_count(&mapped_model).await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_attempts = pool_attempts.max_account_attempts().max(1);
 
@@ -2853,40 +2867,50 @@ pub async fn handle_completions(
             "OpenAI Responses upstream failure classified"
         );
 
-        match openai_retry_action(&failure, remaining) {
+        let action = openai_retry_action(&failure, remaining);
+        if failure.scope == PoolFailureScope::AccountModel {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &failure.sanitized_error,
+                    Some(&mapped_model),
+                )
+                .await;
+        }
+
+        if failure.scope == PoolFailureScope::AccountAuth {
+            let normalized_error = error_text.to_ascii_lowercase();
+            let requires_validation = normalized_error.contains("validation_required")
+                || normalized_error.contains("verify your account")
+                || normalized_error.contains("validation_url")
+                || normalized_error.contains("validationurl");
+            if requires_validation {
+                let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                if let Err(e) = token_manager
+                    .set_validation_block_public(&account_id, block_until, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set validation block: {}", e);
+                }
+            } else if status_code == 403 {
+                if let Err(e) = token_manager
+                    .set_forbidden(&account_id, &failure.sanitized_error)
+                    .await
+                {
+                    tracing::error!("Failed to set forbidden status: {}", e);
+                }
+            }
+        }
+
+        match action {
             OpenAiRetryAction::CooldownAndRotate => {
-                if failure.scope == PoolFailureScope::AccountModel {
-                    token_manager
-                        .mark_rate_limited_async(
-                            &email,
-                            status_code,
-                            retry_after.as_deref(),
-                            &error_text,
-                            Some(&mapped_model),
-                        )
-                        .await;
-                }
-
-                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
-                    if error_text.contains("VALIDATION_REQUIRED")
-                        || error_text.contains("verify your account")
-                        || error_text.contains("validation_url")
-                    {
-                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
-                        if let Err(e) = token_manager
-                            .set_validation_block_public(&account_id, block_until, &error_text)
-                            .await
-                        {
-                            tracing::error!("Failed to set validation block: {}", e);
-                        }
-                    }
-                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
-                        tracing::error!("Failed to set forbidden status: {}", e);
-                    }
-                }
-
                 force_rotate = true;
                 continue;
+            }
+            OpenAiRetryAction::CooldownAndReturn => {
+                return openai_pool_error_response(&pool_attempts, &mapped_model, Some(&email));
             }
             OpenAiRetryAction::ReturnProviderStatus | OpenAiRetryAction::ReturnFailure => {
                 return openai_pool_error_response(&pool_attempts, &mapped_model, Some(&email));

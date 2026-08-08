@@ -133,7 +133,13 @@ pub async fn handle_generate(
     // 2. 获取 UpstreamClient 和 TokenManager
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
-    let pool_size = token_manager.len();
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &model_name,
+        &*state.custom_mapping.read().await,
+    );
+    let pool_size = token_manager
+        .eligible_account_count(&initial_mapped_model)
+        .await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_account_attempts = pool_attempts.max_account_attempts().max(1);
     let max_request_attempts = max_account_attempts.saturating_mul(4).max(1);
@@ -332,7 +338,14 @@ pub async fn handle_generate(
                     continue;
                 }
 
-                pool_attempts.record_failure(&account_id, PoolFailure::transport(&e));
+                let failure = PoolFailure::transport(&e);
+                pool_attempts.record_failure(&account_id, failure.clone());
+                excluded_account_ids.insert(account_id);
+                let remaining = max_account_attempts.saturating_sub(selected_account_ids.len());
+                if gemini_retry_action(&failure, remaining) == GeminiRetryAction::RotateAccount {
+                    force_rotate = true;
+                    continue;
+                }
                 break;
             }
         };
@@ -460,7 +473,15 @@ pub async fn handle_generate(
                         continue;
                     }
 
-                    pool_attempts.record_failure(&account_id, PoolFailure::transport(&last_error));
+                    let failure = PoolFailure::transport(&last_error);
+                    pool_attempts.record_failure(&account_id, failure.clone());
+                    excluded_account_ids.insert(account_id);
+                    let remaining = max_account_attempts.saturating_sub(selected_account_ids.len());
+                    if gemini_retry_action(&failure, remaining) == GeminiRetryAction::RotateAccount
+                    {
+                        force_rotate = true;
+                        continue;
+                    }
                     break;
                 }
 
@@ -798,7 +819,7 @@ pub async fn handle_generate(
                         &email,
                         status_code,
                         retry_after.as_deref(),
-                        &error_text,
+                        &failure.sanitized_error,
                         Some(&mapped_model),
                     )
                     .await;
@@ -813,7 +834,11 @@ pub async fn handle_generate(
                 if requires_validation {
                     let block_until = chrono::Utc::now().timestamp() + 10 * 60;
                     if let Err(error) = token_manager
-                        .set_validation_block_public(&account_id, block_until, &error_text)
+                        .set_validation_block_public(
+                            &account_id,
+                            block_until,
+                            &failure.sanitized_error,
+                        )
                         .await
                     {
                         tracing::error!(
@@ -823,7 +848,9 @@ pub async fn handle_generate(
                         );
                     }
                 } else if status_code == 403 {
-                    if let Err(error) = token_manager.set_forbidden(&account_id, &error_text).await
+                    if let Err(error) = token_manager
+                        .set_forbidden(&account_id, &failure.sanitized_error)
+                        .await
                     {
                         tracing::error!(
                             "[Gemini] Failed to mark forbidden account {}: {}",
@@ -870,6 +897,20 @@ pub async fn handle_generate(
                 );
                 force_rotate = true;
                 continue;
+            }
+            GeminiRetryAction::RotateAccount => {
+                excluded_account_ids.insert(account_id);
+                force_rotate = true;
+                continue;
+            }
+            GeminiRetryAction::CooldownAndReturn => {
+                return Ok(gemini_error_response(
+                    pool_attempts.terminal_status(),
+                    &failure.sanitized_error,
+                    Some(&email),
+                    Some(&mapped_model),
+                    pool_attempts.retry_after(),
+                ));
             }
             GeminiRetryAction::ReturnProviderStatus => {
                 tracing::warn!(
