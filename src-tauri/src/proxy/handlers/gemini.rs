@@ -894,11 +894,11 @@ pub async fn handle_generate(
                 attempt + 1
             );
             return Ok(gemini_error_response(
-                status_code,
-                &error_text,
+                failure.status,
+                &failure.sanitized_error,
                 Some(&email),
                 Some(&mapped_model),
-                retry_after.as_deref(),
+                failure.retry_after.as_deref(),
             ));
         }
 
@@ -935,15 +935,15 @@ pub async fn handle_generate(
                 tracing::warn!(
                     protocol = "gemini",
                     failure_scope = ?failure_scope,
-                    terminal_status = status_code,
+                    terminal_status = failure.status,
                     "Returning provider-scoped Gemini failure without account cooldown"
                 );
                 return Ok(gemini_error_response(
-                    status_code,
-                    &error_text,
+                    failure.status,
+                    &failure.sanitized_error,
                     Some(&email),
                     Some(&mapped_model),
-                    retry_after.as_deref(),
+                    failure.retry_after.as_deref(),
                 ));
             }
             GeminiRetryAction::ReturnFailure => {
@@ -956,14 +956,14 @@ pub async fn handle_generate(
 
                 error!(
                     "Gemini upstream non-retryable error {} (scope {:?})",
-                    status_code, failure_scope
+                    failure.status, failure_scope
                 );
                 return Ok(gemini_error_response(
-                    status_code,
-                    &error_text,
+                    failure.status,
+                    &failure.sanitized_error,
                     Some(&email),
                     Some(&mapped_model),
-                    retry_after.as_deref(),
+                    failure.retry_after.as_deref(),
                 ));
             }
         }
