@@ -50,6 +50,13 @@ pub enum OpenAiRetryAction {
     ReturnFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeRetryAction {
+    CooldownAndRotate,
+    ReturnProviderStatus,
+    ReturnFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolFailure {
     pub status: u16,
@@ -102,7 +109,7 @@ impl PoolAttemptState {
     pub fn record_failure(&mut self, account_id: impl Into<String>, failure: PoolFailure) {
         let account_id = account_id.into();
         self.attempted_account_ids.insert(account_id.clone());
-        if failure.should_cooldown_account() {
+        if failure.scope == PoolFailureScope::AccountModel {
             self.account_limit_account_ids.insert(account_id);
         }
 
@@ -233,6 +240,31 @@ pub fn openai_retry_action(
         | PoolFailureScope::AccountModel
         | PoolFailureScope::Transport
         | PoolFailureScope::Unknown => OpenAiRetryAction::ReturnFailure,
+    }
+}
+
+pub fn claude_retry_action(
+    failure: &PoolFailure,
+    remaining_account_attempts: usize,
+) -> ClaudeRetryAction {
+    match failure.scope {
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel
+            if remaining_account_attempts > 0 =>
+        {
+            ClaudeRetryAction::CooldownAndRotate
+        }
+        PoolFailureScope::ProviderModel => ClaudeRetryAction::ReturnProviderStatus,
+        PoolFailureScope::AccountAuth
+        | PoolFailureScope::AccountModel
+        | PoolFailureScope::Transport
+        | PoolFailureScope::Unknown => ClaudeRetryAction::ReturnFailure,
+    }
+}
+
+pub fn claude_terminal_status(attempts: &PoolAttemptState) -> u16 {
+    match attempts.terminal_status() {
+        403 => 503,
+        status => status,
     }
 }
 
@@ -388,6 +420,48 @@ mod tests {
     }
 
     #[test]
+    fn claude_account_429_marks_and_rotates() {
+        let failure = classify_pool_failure(429, "quota will reset after 4h", None);
+
+        assert_eq!(
+            claude_retry_action(&failure, 9),
+            ClaudeRetryAction::CooldownAndRotate
+        );
+    }
+
+    #[test]
+    fn claude_provider_capacity_503_preserves_provider_status() {
+        let failure = classify_pool_failure(503, "No capacity available for model", None);
+
+        assert_eq!(
+            claude_retry_action(&failure, 9),
+            ClaudeRetryAction::ReturnProviderStatus
+        );
+    }
+
+    #[test]
+    fn claude_validation_terminal_status_avoids_login_redirect() {
+        let mut attempts = PoolAttemptState::new(2);
+        attempts.record_failure(
+            "acc-1",
+            classify_pool_failure(403, "VALIDATION_REQUIRED", None),
+        );
+
+        assert_eq!(claude_terminal_status(&attempts), 503);
+    }
+
+    #[test]
+    fn claude_whole_pool_account_limit_returns_429() {
+        let mut attempts = PoolAttemptState::new(1);
+        attempts.record_failure(
+            "acc-1",
+            classify_pool_failure(429, "quota will reset after 4h", None),
+        );
+
+        assert_eq!(claude_terminal_status(&attempts), 429);
+    }
+
+    #[test]
     fn verification_failure_blocks_only_the_account() {
         let failure = classify_pool_failure(429, "Verify your account to continue.", None);
 
@@ -471,6 +545,18 @@ mod tests {
         );
         assert!(state.whole_pool_exhausted());
         assert_eq!(state.terminal_status(), 429);
+    }
+
+    #[test]
+    fn authentication_failure_does_not_claim_quota_exhaustion() {
+        let mut state = PoolAttemptState::new(1);
+        state.record_failure(
+            "acc-1",
+            classify_pool_failure(403, "VALIDATION_REQUIRED", None),
+        );
+
+        assert!(!state.whole_pool_exhausted());
+        assert_eq!(state.terminal_status(), 403);
     }
 
     #[test]

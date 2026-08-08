@@ -9,7 +9,6 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use tokio::time::Duration;
 use tracing::{debug, error, info};
 
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Import Adapter Registry
@@ -27,6 +26,62 @@ use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 use std::sync::{atomic::Ordering, Arc}; // [NEW]
+
+use super::pool_retry::{
+    classify_pool_failure, claude_retry_action, claude_terminal_status, ClaudeRetryAction,
+    PoolAttemptState, PoolFailure, PoolFailureScope,
+};
+
+fn claude_pool_error_response(
+    attempts: &PoolAttemptState,
+    mapped_model: Option<&str>,
+    account_email: Option<&str>,
+) -> Response {
+    let status =
+        StatusCode::from_u16(claude_terminal_status(attempts)).unwrap_or(StatusCode::BAD_GATEWAY);
+    let error_type = match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        _ => "api_error",
+    };
+    let message = attempts
+        .last_failure()
+        .map(|failure| failure.sanitized_error.as_str())
+        .unwrap_or("No eligible upstream account was available");
+    let mut response = (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "id": "err_retry_exhausted",
+                "type": error_type,
+                "message": message
+            }
+        })),
+    )
+        .into_response();
+
+    if let Some(model) = mapped_model {
+        if let Ok(value) = header::HeaderValue::from_str(model) {
+            response.headers_mut().insert("X-Mapped-Model", value);
+        }
+    }
+    if let Some(email) = account_email {
+        if let Ok(value) = header::HeaderValue::from_str(email) {
+            response.headers_mut().insert("X-Account-Email", value);
+        }
+    }
+    if let Some(retry_after) = attempts.retry_after() {
+        if let Ok(value) = header::HeaderValue::from_str(retry_after) {
+            response.headers_mut().insert("Retry-After", value);
+        }
+    }
+
+    response
+}
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -160,8 +215,6 @@ fn apply_thinking_hints(
     }
 }
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
-
 // ===== Model Constants for Background Tasks =====
 // These can be adjusted for performance/cost optimization or overridden by custom_mapping
 const INTERNAL_BACKGROUND_TASK: &str = "internal-background-task"; // Unified virtual ID for all background tasks
@@ -234,14 +287,6 @@ The structure MUST be as follows:
 
 // [REMOVED] apply_jitter function
 // Jitter logic removed to restore stability (v3.3.16 fix)
-
-// ===== 统一退避策略模块 =====
-// 移除本地重复定义，使用 common 中的统一实现
-use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
-};
-
-// ===== 退避策略模块结束 =====
 
 #[cfg(test)]
 mod variant_tests {
@@ -790,18 +835,21 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
 
     let pool_size = token_manager.len();
-    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries (e.g. stripping signatures)
-    // even if the user has only 1 account.
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let mut pool_attempts = PoolAttemptState::new(pool_size);
+    let max_attempts = pool_attempts.max_account_attempts().max(1);
 
     let mut last_error = String::new();
-    let retried_without_thinking = false;
+    let mut retried_without_thinking = false;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
-    let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
 
-    for attempt in 0..max_attempts {
+    // One extra handler pass is reserved for the same-account thinking repair.
+    for attempt in 0..=max_attempts {
+        if pool_attempts.attempted_account_ids().len() >= max_attempts {
+            break;
+        }
+
         // 2. 模型路由解析
         let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
@@ -833,11 +881,12 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &config.final_model,
+                pool_attempts.attempted_account_ids(),
             )
             .await
         {
@@ -863,7 +912,6 @@ pub async fn handle_messages(
                     .into_response();
             }
         };
-
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -1208,6 +1256,8 @@ pub async fn handle_messages(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                pool_attempts.record_failure(&account_id, PoolFailure::transport(&e));
+                force_rotate = true;
                 debug!(
                     "Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -1254,8 +1304,6 @@ pub async fn handle_messages(
         // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
-        last_status = status;
-
         // 成功
         if status.is_success() {
             // [智能限流] 请求成功，重置该账号的连续失败计数
@@ -1370,6 +1418,8 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    pool_attempts.record_failure(&account_id, PoolFailure::transport(&last_error));
+                    force_rotate = true;
                     continue;
                 }
 
@@ -1462,6 +1512,9 @@ pub async fn handle_messages(
                             trace_id
                         );
                         last_error = "Empty response stream (None)".to_string();
+                        pool_attempts
+                            .record_failure(&account_id, PoolFailure::transport(&last_error));
+                        force_rotate = true;
                         continue;
                     }
                 }
@@ -1566,7 +1619,6 @@ pub async fn handle_messages(
 
         // 1. 立即提取状态码和 headers（防止 response 被 move）
         let status_code = status.as_u16();
-        last_status = status;
         let retry_after = response
             .headers()
             .get("Retry-After")
@@ -1578,7 +1630,6 @@ pub async fn handle_messages(
             .text()
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status));
-        last_error = format!("HTTP {}: {}", status_code, error_text);
         debug!("[{}] Upstream Error Response: {}", trace_id, error_text);
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -1603,25 +1654,6 @@ pub async fn handle_messages(
             .await;
         }
 
-        // 3. 标记限流状态(用于 UI 显示) - 使用异步版本以支持实时配额刷新
-        // 🆕 传入实际使用的模型,实现模型级别限流,避免不同模型配额互相影响
-        if status_code == 429
-            || status_code == 529
-            || status_code == 503
-            || status_code == 500
-            || status_code == 404
-        {
-            token_manager
-                .mark_rate_limited_async(
-                    &email,
-                    status_code,
-                    retry_after.as_deref(),
-                    &error_text,
-                    Some(&request_with_mapped.model),
-                )
-                .await;
-        }
-
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)
         if status_code == 400
             && !retried_without_thinking
@@ -1639,7 +1671,7 @@ pub async fn handle_messages(
                 || error_text.contains("must be `thinking`")
                 || error_text.contains("must be 'thinking'"))
         {
-            // Existing logic for thinking signature...\n            retried_without_thinking = true;
+            retried_without_thinking = true;
 
             // 使用 WARN 级别,因为这不应该经常发生(已经主动过滤过)
             tracing::warn!(
@@ -1724,189 +1756,96 @@ pub async fn handle_messages(
                 request_for_body.model = m;
             }
 
-            // [FIX] 强制重试：因为我们已经清理了 thinking block，所以这是一个新的、可以重试的请求
-            // 不要使用 determine_retry_strategy，因为它会因为 retried_without_thinking=true 而返回 NoRetry
-            if apply_retry_strategy(
-                RetryStrategy::FixedDelay(Duration::from_millis(200)),
-                attempt,
-                max_attempts,
-                status_code,
-                &trace_id,
-            )
-            .await
-            {
-                continue;
-            }
-        }
-
-        // 5. 统一处理所有可重试错误
-        // [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED,允许账号轮换
-        // 原逻辑会在第一个账号配额耗尽时直接返回,导致"平衡"模式无法切换账号
-
-        // [FIX] 403 时设置 is_forbidden 状态，避免账号被重复选中
-        if status_code == 403 {
-            // Check for VALIDATION_REQUIRED error - temporarily block account
-            if error_text.contains("VALIDATION_REQUIRED")
-                || error_text.contains("verify your account")
-                || error_text.contains("validation_url")
-            {
-                tracing::warn!(
-                    "[Claude] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
-                    email
-                );
-                let block_minutes = 10i64;
-                let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
-                if let Err(e) = token_manager
-                    .set_validation_block_public(&account_id, block_until, &error_text)
-                    .await
-                {
-                    tracing::error!("Failed to set validation block: {}", e);
-                }
-            }
-
-            // 设置 is_forbidden 状态
-            if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
-                tracing::error!("Failed to set forbidden status for {}: {}", email, e);
-            } else {
-                tracing::warn!("[Claude] Account {} marked as forbidden due to 403", email);
-            }
-        }
-
-        // 确定重试策略
-        let retry_strategy =
-            determine_retry_strategy(status_code, &error_text, retried_without_thinking);
-
-        // 执行退避
-        if apply_retry_strategy(
-            retry_strategy.clone(),
-            attempt,
-            max_attempts,
-            status_code,
-            &trace_id,
-        )
-        .await
-        {
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&retry_strategy)) {
-                debug!(
-                    "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
-                    trace_id, status_code
-                );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
+            // The request was repaired locally; retry the same sticky account once.
+            force_rotate = false;
             continue;
-        } else {
-            // 5. 增强的 400 错误处理: Prompt Too Long 友好提示
-            if status_code == 400
-                && (error_text.contains("too long")
-                    || error_text.contains("exceeds")
-                    || error_text.contains("limit"))
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("X-Account-Email", email.as_str())],
-                    Json(json!({
-                        "id": "err_prompt_too_long",
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": "Prompt is too long (server-side context limit reached).",
-                            "suggestion": "Please: 1) Executive '/compact' in Claude Code 2) Reduce conversation history 3) Switch to gemini-1.5-pro (2M context limit)"
-                        }
-                    }))
-                ).into_response();
-            }
+        }
 
-            // 不可重试的错误，直接返回
-            error!(
-                "[{}] Non-retryable error {}: {}",
-                trace_id, status_code, error_text
-            );
+        if status_code == 400
+            && (error_text.contains("too long")
+                || error_text.contains("exceeds")
+                || error_text.contains("limit"))
+        {
             return (
-                status,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                ],
-                error_text,
+                StatusCode::BAD_REQUEST,
+                [("X-Account-Email", email.as_str())],
+                Json(json!({
+                    "id": "err_prompt_too_long",
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Prompt is too long (server-side context limit reached).",
+                        "suggestion": "Please: 1) Execute '/compact' in Claude Code 2) Reduce conversation history 3) Switch to a model with a larger context limit"
+                    }
+                })),
             )
                 .into_response();
         }
-    }
 
-    if let Some(email) = last_email {
-        // [FIX] Include X-Mapped-Model in exhaustion error
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Account-Email",
-            header::HeaderValue::from_str(&email).unwrap(),
+        let failure = classify_pool_failure(status_code, &error_text, retry_after.as_deref());
+        pool_attempts.record_failure(&account_id, failure.clone());
+        let remaining = max_attempts.saturating_sub(pool_attempts.attempted_account_ids().len());
+
+        tracing::warn!(
+            trace_id = %trace_id,
+            account = %mask_email(&email),
+            scope = ?failure.scope,
+            attempted_accounts = pool_attempts.attempted_account_ids().len(),
+            max_account_attempts = max_attempts,
+            status = status_code,
+            "Claude upstream failure classified"
         );
-        if let Some(model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(&model) {
-                headers.insert("X-Mapped-Model", v);
+
+        match claude_retry_action(&failure, remaining) {
+            ClaudeRetryAction::CooldownAndRotate => {
+                if failure.scope == PoolFailureScope::AccountModel {
+                    token_manager
+                        .mark_rate_limited_async(
+                            &email,
+                            status_code,
+                            retry_after.as_deref(),
+                            &error_text,
+                            Some(&request_with_mapped.model),
+                        )
+                        .await;
+                }
+
+                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
+                    if error_text.contains("VALIDATION_REQUIRED")
+                        || error_text.contains("verify your account")
+                        || error_text.contains("validation_url")
+                    {
+                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                        if let Err(e) = token_manager
+                            .set_validation_block_public(&account_id, block_until, &error_text)
+                            .await
+                        {
+                            tracing::error!("Failed to set validation block: {}", e);
+                        }
+                    }
+                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
+                        tracing::error!("Failed to set forbidden status for {}: {}", email, e);
+                    }
+                }
+
+                force_rotate = true;
+                continue;
+            }
+            ClaudeRetryAction::ReturnProviderStatus | ClaudeRetryAction::ReturnFailure => {
+                return claude_pool_error_response(
+                    &pool_attempts,
+                    Some(&request_with_mapped.model),
+                    Some(&email),
+                );
             }
         }
-
-        let error_type = match last_status.as_u16() {
-            400 => "invalid_request_error",
-            401 => "authentication_error",
-            403 => "permission_error",
-            429 => "rate_limit_error",
-            529 => "overloaded_error",
-            _ => "api_error",
-        };
-
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
-
-        (response_status, headers, Json(json!({
-            "type": "error",
-            "error": {
-                "id": "err_retry_exhausted",
-                "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
-            }
-        }))).into_response()
-    } else {
-        // Fallback if no email (e.g. mapping error before token)
-        let mut headers = HeaderMap::new();
-        if let Some(model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(&model) {
-                headers.insert("X-Mapped-Model", v);
-            }
-        }
-
-        let error_type = match last_status.as_u16() {
-            400 => "invalid_request_error",
-            401 => "authentication_error",
-            403 => "permission_error",
-            429 => "rate_limit_error",
-            529 => "overloaded_error",
-            _ => "api_error",
-        };
-
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
-
-        (response_status, headers, Json(json!({
-            "type": "error",
-            "error": {
-                "id": "err_retry_exhausted",
-                "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
-            }
-        }))).into_response()
     }
+
+    claude_pool_error_response(
+        &pool_attempts,
+        last_mapped_model.as_deref(),
+        last_email.as_deref(),
+    )
 }
 
 /// 列出可用模型
