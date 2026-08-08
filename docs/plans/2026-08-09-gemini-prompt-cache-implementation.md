@@ -1,5 +1,10 @@
 # Gemini Prompt Cache Implementation Plan
 
+> **Status: Cancelled after live validation.** The proposed behavior already
+> exists through Google's implicit prompt cache. No production implementation
+> tasks below should be executed unless a future requirement specifically
+> needs explicit cache resources.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add observable, failure-safe prompt cache reuse to AGM's native Gemini request path and verify it against `gemini-2.5-flash`.

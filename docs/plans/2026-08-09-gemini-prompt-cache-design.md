@@ -1,5 +1,12 @@
 # Gemini Prompt Cache Design
 
+> **Status: Superseded by production verification.** Native Gemini implicit
+> prompt caching is already active end to end. Repeated long-prefix Flash
+> requests returned `cachedContentTokenCount`, AGM persisted it, and Sub2
+> recorded it as `cache_read_tokens`. Explicit `cachedContents` lifecycle code
+> is therefore unnecessary and would add risk without fixing the observed
+> behavior.
+
 ## Goal
 
 Enable Prompt Cache for native Gemini requests handled by AGM, so repeated system instructions and tool definitions can be reused by the upstream Gemini service. This is token-prefix caching, not full response caching.
