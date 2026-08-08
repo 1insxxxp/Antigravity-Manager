@@ -1,3 +1,5 @@
+ARG FRONTEND_IMAGE=antigravity-manager:latest
+
 # --- Backend Build Stage (no frontend build) ---
 FROM rust:1-slim-bookworm AS backend-builder
 ARG USE_MIRROR=auto
@@ -49,7 +51,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cp target/release/antigravity_tools /tmp/antigravity_tools
 
 # --- Frontend Dist Stage (reuse prebuilt image) ---
-ARG FRONTEND_IMAGE=antigravity-manager:latest
 FROM ${FRONTEND_IMAGE} AS frontend-prebuilt
 
 # --- Final Runtime Stage ---
