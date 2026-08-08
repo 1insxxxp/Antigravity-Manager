@@ -358,16 +358,6 @@ impl RateLimitTracker {
             }
         };
 
-        let mut retry_sec = retry_sec;
-        if retry_sec > 300 {
-            tracing::info!(
-                "Capping retry lockout time for {} from {}s to 300s (5 minutes)",
-                account_id,
-                retry_sec
-            );
-            retry_sec = 300;
-        }
-
         let info = RateLimitInfo {
             reset_time: SystemTime::now() + Duration::from_secs(retry_sec),
             retry_after_sec: retry_sec,
@@ -534,31 +524,7 @@ impl RateLimitTracker {
         let trimmed = body.trim();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                // 1. Google 常见的 quotaResetDelay 格式 (支持所有格式："2h1m1s", "1h30m", "42s", "500ms" 等)
-                // 路径: error.details[0].metadata.quotaResetDelay
-                if let Some(delay_str) = json
-                    .get("error")
-                    .and_then(|e| e.get("details"))
-                    .and_then(|d| d.as_array())
-                    .and_then(|a| a.get(0))
-                    .and_then(|o| o.get("metadata")) // 添加 metadata 层级
-                    .and_then(|m| m.get("quotaResetDelay"))
-                    .and_then(|v| v.as_str())
-                {
-                    tracing::debug!("[JSON解析] 找到 quotaResetDelay: '{}'", delay_str);
-
-                    // 使用通用时间解析函数
-                    if let Some(seconds) = self.parse_duration_string(delay_str) {
-                        return Some(seconds);
-                    }
-                }
-
-                // 2. OpenAI 常见的 retry_after 字段 (数字)
-                if let Some(retry) = json
-                    .get("error")
-                    .and_then(|e| e.get("retry_after"))
-                    .and_then(|v| v.as_u64())
-                {
+                if let Some(retry) = self.parse_retry_time_from_json(&json, 0) {
                     return Some(retry);
                 }
             }
@@ -611,6 +577,50 @@ impl RateLimitTracker {
         }
 
         None
+    }
+
+    fn parse_retry_time_from_json(&self, value: &serde_json::Value, depth: usize) -> Option<u64> {
+        if depth > 8 {
+            return None;
+        }
+
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(delay_str) = object
+                    .get("quotaResetDelay")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    tracing::debug!("[JSON解析] 找到 quotaResetDelay: '{}'", delay_str);
+                    if let Some(seconds) = self.parse_duration_string(delay_str) {
+                        return Some(seconds);
+                    }
+                }
+
+                if let Some(retry) = object
+                    .get("retry_after")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    return Some(retry);
+                }
+
+                object
+                    .values()
+                    .find_map(|child| self.parse_retry_time_from_json(child, depth + 1))
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .find_map(|child| self.parse_retry_time_from_json(child, depth + 1)),
+            serde_json::Value::String(encoded_json) => {
+                let trimmed = encoded_json.trim();
+                if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|decoded| self.parse_retry_time_from_json(&decoded, depth + 1))
+            }
+            _ => None,
+        }
     }
 
     /// 获取账号的限流信息
@@ -712,6 +722,25 @@ mod tests {
         }"#;
         let time = tracker.parse_retry_time_from_body(body);
         assert_eq!(time, Some(42));
+    }
+
+    #[test]
+    fn test_parse_nested_google_json_delay() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{"error":{"code":400,"message":"{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{\"reason\":\"QUOTA_EXHAUSTED\",\"metadata\":{\"quotaResetDelay\":\"4h43m56.951838214s\"}}]}}"}}"#;
+
+        let info = tracker
+            .parse_from_error(
+                "nested-quota-account",
+                429,
+                None,
+                body,
+                Some("gemini-2.5-pro".to_string()),
+                &[60, 300, 1800, 7200],
+            )
+            .expect("nested account quota should create a model lockout");
+
+        assert_eq!(info.retry_after_sec, 17_037);
     }
 
     #[test]
