@@ -15,8 +15,8 @@ use crate::proxy::handlers::common::{
     apply_retry_strategy, determine_retry_strategy, RetryStrategy,
 };
 use crate::proxy::handlers::pool_retry::{
-    classify_pool_failure, gemini_retry_action, GeminiRetryAction, PoolAttemptState, PoolFailure,
-    PoolFailureScope,
+    account_auth_protection, classify_pool_failure, gemini_retry_action, AccountAuthProtection,
+    GeminiRetryAction, PoolAttemptState, PoolFailure, PoolFailureScope,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -137,8 +137,34 @@ pub async fn handle_generate(
         &model_name,
         &*state.custom_mapping.read().await,
     );
+    let initial_tools_val: Option<Vec<Value>> = body
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|entries| {
+            let mut flattened = Vec::new();
+            for entry in entries {
+                if let Some(declarations) = entry
+                    .get("functionDeclarations")
+                    .and_then(|value| value.as_array())
+                {
+                    flattened.extend(declarations.iter().cloned());
+                } else {
+                    flattened.push(entry.clone());
+                }
+            }
+            flattened
+        });
+    let initial_config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &model_name,
+        &initial_mapped_model,
+        &initial_tools_val,
+        None,
+        None,
+        None,
+        Some(&body),
+    );
     let pool_size = token_manager
-        .eligible_account_count(&initial_mapped_model)
+        .eligible_account_count(&initial_config.final_model)
         .await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_account_attempts = pool_attempts.max_account_attempts().max(1);
@@ -820,44 +846,37 @@ pub async fn handle_generate(
                         status_code,
                         retry_after.as_deref(),
                         &failure.sanitized_error,
-                        Some(&mapped_model),
+                        Some(&config.final_model),
                     )
                     .await;
                 excluded_account_ids.insert(account_id.clone());
             }
             PoolFailureScope::AccountAuth => {
-                let normalized_error = error_text.to_ascii_lowercase();
-                let requires_validation = normalized_error.contains("validation_required")
-                    || normalized_error.contains("verify your account")
-                    || normalized_error.contains("validation_url")
-                    || normalized_error.contains("validationurl");
-                if requires_validation {
-                    let block_until = chrono::Utc::now().timestamp() + 10 * 60;
-                    if let Err(error) = token_manager
-                        .set_validation_block_public(
-                            &account_id,
-                            block_until,
-                            &failure.sanitized_error,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            "[Gemini] Failed to set validation block for {}: {}",
-                            mask_email(&email),
-                            error
-                        );
+                let protection = account_auth_protection(status_code, &error_text);
+                let result = match protection {
+                    AccountAuthProtection::ValidationBlock => {
+                        let block_until = chrono::Utc::now().timestamp() + 10 * 60;
+                        token_manager
+                            .set_validation_block_public(
+                                &account_id,
+                                block_until,
+                                &failure.sanitized_error,
+                            )
+                            .await
                     }
-                } else if status_code == 403 {
-                    if let Err(error) = token_manager
-                        .set_forbidden(&account_id, &failure.sanitized_error)
-                        .await
-                    {
-                        tracing::error!(
-                            "[Gemini] Failed to mark forbidden account {}: {}",
-                            mask_email(&email),
-                            error
-                        );
+                    AccountAuthProtection::Forbidden => {
+                        token_manager
+                            .set_forbidden(&account_id, &failure.sanitized_error)
+                            .await
                     }
+                };
+                if let Err(error) = result {
+                    tracing::error!(
+                        "[Gemini] Failed to persist {:?} for {}: {}",
+                        protection,
+                        mask_email(&email),
+                        error
+                    );
                 }
                 excluded_account_ids.insert(account_id.clone());
             }

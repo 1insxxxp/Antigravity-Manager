@@ -28,8 +28,8 @@ use axum::http::HeaderMap;
 use std::sync::{atomic::Ordering, Arc}; // [NEW]
 
 use super::pool_retry::{
-    classify_pool_failure, claude_retry_action, claude_terminal_status, ClaudeRetryAction,
-    PoolAttemptState, PoolFailure, PoolFailureScope,
+    account_auth_protection, classify_pool_failure, claude_retry_action, claude_terminal_status,
+    AccountAuthProtection, ClaudeRetryAction, PoolAttemptState, PoolFailure, PoolFailureScope,
 };
 
 fn claude_pool_error_response(
@@ -838,8 +838,22 @@ pub async fn handle_messages(
         &request_for_body.model,
         &*state.custom_mapping.read().await,
     );
+    let initial_tools_val: Option<Vec<Value>> = request_for_body.tools.as_ref().map(|list| {
+        list.iter()
+            .map(|tool| serde_json::to_value(tool).unwrap_or(json!({})))
+            .collect()
+    });
+    let initial_config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &request_for_body.model,
+        &initial_mapped_model,
+        &initial_tools_val,
+        request.size.as_deref(),
+        request.quality.as_deref(),
+        None,
+        None,
+    );
     let pool_size = token_manager
-        .eligible_account_count(&initial_mapped_model)
+        .eligible_account_count(&initial_config.final_model)
         .await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_attempts = pool_attempts.max_account_attempts().max(1);
@@ -1816,26 +1830,31 @@ pub async fn handle_messages(
         }
 
         if failure.scope == PoolFailureScope::AccountAuth {
-            let normalized_error = error_text.to_ascii_lowercase();
-            let requires_validation = normalized_error.contains("validation_required")
-                || normalized_error.contains("verify your account")
-                || normalized_error.contains("validation_url")
-                || normalized_error.contains("validationurl");
-            if requires_validation {
-                let block_until = chrono::Utc::now().timestamp() + (10 * 60);
-                if let Err(e) = token_manager
-                    .set_validation_block_public(&account_id, block_until, &failure.sanitized_error)
-                    .await
-                {
-                    tracing::error!("Failed to set validation block: {}", e);
+            let protection = account_auth_protection(status_code, &error_text);
+            let result = match protection {
+                AccountAuthProtection::ValidationBlock => {
+                    let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                    token_manager
+                        .set_validation_block_public(
+                            &account_id,
+                            block_until,
+                            &failure.sanitized_error,
+                        )
+                        .await
                 }
-            } else if status_code == 403 {
-                if let Err(e) = token_manager
-                    .set_forbidden(&account_id, &failure.sanitized_error)
-                    .await
-                {
-                    tracing::error!("Failed to set forbidden status for {}: {}", email, e);
+                AccountAuthProtection::Forbidden => {
+                    token_manager
+                        .set_forbidden(&account_id, &failure.sanitized_error)
+                        .await
                 }
+            };
+            if let Err(error) = result {
+                tracing::error!(
+                    "Failed to persist {:?} for Claude account {}: {}",
+                    protection,
+                    mask_email(&email),
+                    error
+                );
             }
         }
 

@@ -29,6 +29,12 @@ pub enum PoolFailureScope {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAuthProtection {
+    ValidationBlock,
+    Forbidden,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryDisposition {
     RotateAccount,
@@ -160,6 +166,7 @@ impl PoolAttemptState {
         }
 
         match self.last_failure.as_ref() {
+            Some(failure) if failure.scope == PoolFailureScope::AccountAuth => 503,
             Some(failure)
                 if failure.scope != PoolFailureScope::Transport && failure.status != 0 =>
             {
@@ -184,10 +191,10 @@ pub fn classify_pool_failure(
     let normalized = error_text.to_ascii_lowercase();
     let scope = if matches!(status, 401 | 403) || is_account_auth_failure(&normalized) {
         PoolFailureScope::AccountAuth
+    } else if matches!(status, 429 | 503) && is_provider_model_failure(&normalized) {
+        PoolFailureScope::ProviderModel
     } else if status == 429 {
         PoolFailureScope::AccountModel
-    } else if status == 503 && is_provider_model_failure(&normalized) {
-        PoolFailureScope::ProviderModel
     } else {
         PoolFailureScope::Unknown
     };
@@ -201,12 +208,29 @@ pub fn classify_pool_failure(
         | PoolFailureScope::Unknown => RetryDisposition::Return,
     };
 
+    let terminal_status = if scope == PoolFailureScope::ProviderModel && status == 429 {
+        503
+    } else {
+        status
+    };
+
     PoolFailure {
-        status,
+        status: terminal_status,
         scope,
         disposition,
         retry_after: retry_after.map(str::to_owned),
         sanitized_error: sanitize_error(error_text),
+    }
+}
+
+pub fn account_auth_protection(status: u16, error_text: &str) -> AccountAuthProtection {
+    let normalized = error_text.to_ascii_lowercase();
+    if is_permanent_account_auth_failure(&normalized)
+        || (status == 403 && !is_account_auth_failure(&normalized))
+    {
+        AccountAuthProtection::Forbidden
+    } else {
+        AccountAuthProtection::ValidationBlock
     }
 }
 
@@ -301,6 +325,17 @@ fn is_provider_model_failure(normalized: &str) -> bool {
         || normalized.contains("model_capacity_exhausted")
 }
 
+fn is_permanent_account_auth_failure(normalized: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "permission denied",
+        "insufficient permissions",
+        "account suspended",
+        "account disabled",
+    ];
+
+    MARKERS.iter().any(|marker| normalized.contains(marker))
+}
+
 fn sanitize_error(error_text: &str) -> String {
     let without_request_body = REQUEST_BODY_RE.replace(error_text, "$1: [REDACTED]");
     let without_bearer = BEARER_CREDENTIAL_RE.replace_all(&without_request_body, "$1 [REDACTED]");
@@ -342,6 +377,56 @@ mod tests {
 
         assert_eq!(failure.scope, PoolFailureScope::ProviderModel);
         assert_eq!(failure.disposition, RetryDisposition::Return);
+    }
+
+    #[test]
+    fn provider_capacity_marker_overrides_429_account_default() {
+        let failure =
+            classify_pool_failure(429, r#"{"reason":"MODEL_CAPACITY_EXHAUSTED"}"#, Some("30"));
+
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.scope, PoolFailureScope::ProviderModel);
+        assert_eq!(failure.disposition, RetryDisposition::Return);
+        assert!(!failure.should_cooldown_account());
+    }
+
+    #[test]
+    fn account_auth_failures_always_receive_persistent_protection() {
+        assert_eq!(
+            account_auth_protection(429, "Account verification required"),
+            AccountAuthProtection::ValidationBlock
+        );
+        assert_eq!(
+            account_auth_protection(429, "risk-control"),
+            AccountAuthProtection::ValidationBlock
+        );
+        assert_eq!(
+            account_auth_protection(401, "Unauthorized"),
+            AccountAuthProtection::ValidationBlock
+        );
+        assert_eq!(
+            account_auth_protection(403, "Permission denied"),
+            AccountAuthProtection::Forbidden
+        );
+        assert_eq!(
+            account_auth_protection(403, "Verify your account to continue"),
+            AccountAuthProtection::ValidationBlock
+        );
+        assert_eq!(
+            account_auth_protection(429, "Account suspended"),
+            AccountAuthProtection::Forbidden
+        );
+    }
+
+    #[test]
+    fn account_auth_terminal_failure_is_service_unavailable() {
+        let mut state = PoolAttemptState::new(1);
+        state.record_failure(
+            "account-a",
+            classify_pool_failure(401, "Unauthorized", None),
+        );
+
+        assert_eq!(state.terminal_status(), 503);
     }
 
     #[test]
@@ -577,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn authentication_failure_does_not_claim_quota_exhaustion() {
+    fn authentication_failure_is_service_unavailable_without_claiming_quota_exhaustion() {
         let mut state = PoolAttemptState::new(1);
         state.record_failure(
             "acc-1",
@@ -585,7 +670,7 @@ mod tests {
         );
 
         assert!(!state.whole_pool_exhausted());
-        assert_eq!(state.terminal_status(), 403);
+        assert_eq!(state.terminal_status(), 503);
     }
 
     #[test]

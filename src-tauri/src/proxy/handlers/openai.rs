@@ -18,8 +18,8 @@ use crate::proxy::upstream::client::mask_email;
 const MAX_RETRY_ATTEMPTS: usize = 3;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
 use super::pool_retry::{
-    classify_pool_failure, openai_retry_action, OpenAiRetryAction, PoolAttemptState, PoolFailure,
-    PoolFailureScope,
+    account_auth_protection, classify_pool_failure, openai_retry_action, AccountAuthProtection,
+    OpenAiRetryAction, PoolAttemptState, PoolFailure, PoolFailureScope,
 };
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
@@ -524,7 +524,22 @@ pub async fn handle_chat_completions(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
-    let pool_size = token_manager.eligible_account_count(&mapped_model).await;
+    let initial_tools_val: Option<Vec<Value>> = openai_req
+        .tools
+        .as_ref()
+        .map(|list| list.iter().cloned().collect());
+    let initial_config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &openai_req.model,
+        &mapped_model,
+        &initial_tools_val,
+        None,
+        None,
+        None,
+        None,
+    );
+    let pool_size = token_manager
+        .eligible_account_count(&initial_config.final_model)
+        .await;
     let mut pool_attempts = PoolAttemptState::new(pool_size);
     let max_attempts = pool_attempts.max_account_attempts().max(1);
 
@@ -560,7 +575,7 @@ pub async fn handle_chat_completions(
                 &config.request_type,
                 force_rotate,
                 Some(&session_id),
-                &mapped_model,
+                &config.final_model,
                 pool_attempts.attempted_account_ids(),
             )
             .await
@@ -1119,32 +1134,37 @@ pub async fn handle_chat_completions(
                     status_code,
                     _retry_after.as_deref(),
                     &failure.sanitized_error,
-                    Some(&mapped_model),
+                    Some(&config.final_model),
                 )
                 .await;
         }
 
         if failure.scope == PoolFailureScope::AccountAuth {
-            let normalized_error = error_text.to_ascii_lowercase();
-            let requires_validation = normalized_error.contains("validation_required")
-                || normalized_error.contains("verify your account")
-                || normalized_error.contains("validation_url")
-                || normalized_error.contains("validationurl");
-            if requires_validation {
-                let block_until = chrono::Utc::now().timestamp() + (10 * 60);
-                if let Err(e) = token_manager
-                    .set_validation_block_public(&account_id, block_until, &failure.sanitized_error)
-                    .await
-                {
-                    tracing::error!("Failed to set validation block: {}", e);
+            let protection = account_auth_protection(status_code, &error_text);
+            let result = match protection {
+                AccountAuthProtection::ValidationBlock => {
+                    let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                    token_manager
+                        .set_validation_block_public(
+                            &account_id,
+                            block_until,
+                            &failure.sanitized_error,
+                        )
+                        .await
                 }
-            } else if status_code == 403 {
-                if let Err(e) = token_manager
-                    .set_forbidden(&account_id, &failure.sanitized_error)
-                    .await
-                {
-                    tracing::error!("Failed to set forbidden status: {}", e);
+                AccountAuthProtection::Forbidden => {
+                    token_manager
+                        .set_forbidden(&account_id, &failure.sanitized_error)
+                        .await
                 }
+            };
+            if let Err(error) = result {
+                tracing::error!(
+                    "Failed to persist {:?} for OpenAI account {}: {}",
+                    protection,
+                    mask_email(&email),
+                    error
+                );
             }
         }
 
