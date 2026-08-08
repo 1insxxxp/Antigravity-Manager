@@ -914,7 +914,7 @@ pub async fn handle_generate(
         .last_failure()
         .map(|failure| failure.sanitized_error.as_str())
         .filter(|error| !error.is_empty())
-        .unwrap_or_else(|| {
+        .unwrap_or({
             if last_error.is_empty() {
                 "No eligible AGM account could complete the request"
             } else {

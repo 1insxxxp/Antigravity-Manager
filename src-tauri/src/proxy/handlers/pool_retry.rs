@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::{collections::HashSet, time::Duration};
+use std::collections::HashSet;
 
 const MAX_ACCOUNT_ATTEMPTS: usize = 10;
 const MAX_SANITIZED_ERROR_CHARS: usize = 1_024;
@@ -32,7 +32,6 @@ pub enum PoolFailureScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryDisposition {
     RotateAccount,
-    GraceRetry(Duration),
     Return,
 }
 
