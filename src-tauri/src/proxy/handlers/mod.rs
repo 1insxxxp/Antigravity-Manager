@@ -7,4 +7,5 @@ pub mod common;
 pub mod gemini;
 pub mod mcp;
 pub mod openai;
+pub mod pool_retry;
 pub mod warmup; // 预热处理器
