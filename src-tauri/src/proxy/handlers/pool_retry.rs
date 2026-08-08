@@ -68,25 +68,28 @@ impl PoolFailure {
 #[derive(Debug, Clone)]
 pub struct PoolAttemptState {
     attempted_account_ids: HashSet<String>,
+    account_limit_account_ids: HashSet<String>,
+    pool_size: usize,
     max_account_attempts: usize,
     last_failure: Option<PoolFailure>,
-    account_limit_failures: usize,
 }
 
 impl PoolAttemptState {
     pub fn new(pool_size: usize) -> Self {
         Self {
             attempted_account_ids: HashSet::new(),
+            account_limit_account_ids: HashSet::new(),
+            pool_size,
             max_account_attempts: pool_size.min(MAX_ACCOUNT_ATTEMPTS),
             last_failure: None,
-            account_limit_failures: 0,
         }
     }
 
     pub fn record_failure(&mut self, account_id: impl Into<String>, failure: PoolFailure) {
-        let is_new_account = self.attempted_account_ids.insert(account_id.into());
-        if is_new_account && failure.should_cooldown_account() {
-            self.account_limit_failures += 1;
+        let account_id = account_id.into();
+        self.attempted_account_ids.insert(account_id.clone());
+        if failure.should_cooldown_account() {
+            self.account_limit_account_ids.insert(account_id);
         }
 
         let has_meaningful_http_failure = self
@@ -111,13 +114,14 @@ impl PoolAttemptState {
     }
 
     pub fn account_limit_failure_count(&self) -> usize {
-        self.account_limit_failures
+        self.account_limit_account_ids.len()
     }
 
     pub fn whole_pool_exhausted(&self) -> bool {
-        self.max_account_attempts > 0
-            && self.attempted_account_ids.len() >= self.max_account_attempts
-            && self.account_limit_failures == self.attempted_account_ids.len()
+        self.pool_size > 0
+            && self.pool_size <= MAX_ACCOUNT_ATTEMPTS
+            && self.attempted_account_ids.len() >= self.pool_size
+            && self.account_limit_account_ids.len() == self.attempted_account_ids.len()
     }
 
     pub fn terminal_status(&self) -> u16 {
@@ -351,6 +355,40 @@ mod tests {
         );
         assert!(state.whole_pool_exhausted());
         assert_eq!(state.terminal_status(), 429);
+    }
+
+    #[test]
+    fn capped_attempts_do_not_claim_a_larger_pool_is_exhausted() {
+        let mut state = PoolAttemptState::new(11);
+
+        for index in 0..10 {
+            state.record_failure(
+                format!("acc-{index}"),
+                classify_pool_failure(
+                    429,
+                    "Account quota exhausted; quota will reset after 1h.",
+                    None,
+                ),
+            );
+        }
+
+        assert!(!state.whole_pool_exhausted());
+    }
+
+    #[test]
+    fn later_account_limit_updates_the_same_attempted_account() {
+        let mut state = PoolAttemptState::new(1);
+        state.record_failure(
+            "acc-1",
+            classify_pool_failure(500, "temporary upstream failure", None),
+        );
+        state.record_failure(
+            "acc-1",
+            classify_pool_failure(429, "Account quota exhausted; reset after 1h.", None),
+        );
+
+        assert_eq!(state.account_limit_failure_count(), 1);
+        assert!(state.whole_pool_exhausted());
     }
 
     #[test]
