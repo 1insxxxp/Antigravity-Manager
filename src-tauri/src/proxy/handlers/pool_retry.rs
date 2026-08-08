@@ -43,6 +43,13 @@ pub enum GeminiRetryAction {
     ReturnFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiRetryAction {
+    CooldownAndRotate,
+    ReturnProviderStatus,
+    ReturnFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolFailure {
     pub status: u16,
@@ -211,6 +218,24 @@ pub fn gemini_retry_action(
     }
 }
 
+pub fn openai_retry_action(
+    failure: &PoolFailure,
+    remaining_account_attempts: usize,
+) -> OpenAiRetryAction {
+    match failure.scope {
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel
+            if remaining_account_attempts > 0 =>
+        {
+            OpenAiRetryAction::CooldownAndRotate
+        }
+        PoolFailureScope::ProviderModel => OpenAiRetryAction::ReturnProviderStatus,
+        PoolFailureScope::AccountAuth
+        | PoolFailureScope::AccountModel
+        | PoolFailureScope::Transport
+        | PoolFailureScope::Unknown => OpenAiRetryAction::ReturnFailure,
+    }
+}
+
 fn is_account_auth_failure(normalized: &str) -> bool {
     const MARKERS: &[&str] = &[
         "verify your account",
@@ -329,6 +354,36 @@ mod tests {
         assert_eq!(
             gemini_retry_action(&failure, 9),
             GeminiRetryAction::ReturnProviderStatus
+        );
+    }
+
+    #[test]
+    fn openai_account_429_marks_and_rotates() {
+        let failure = classify_pool_failure(429, "quota will reset after 4h", None);
+
+        assert_eq!(
+            openai_retry_action(&failure, 9),
+            OpenAiRetryAction::CooldownAndRotate
+        );
+    }
+
+    #[test]
+    fn openai_provider_capacity_503_preserves_provider_status() {
+        let failure = classify_pool_failure(503, "No capacity available for model", None);
+
+        assert_eq!(
+            openai_retry_action(&failure, 9),
+            OpenAiRetryAction::ReturnProviderStatus
+        );
+    }
+
+    #[test]
+    fn openai_account_failure_stops_when_no_accounts_remain() {
+        let failure = classify_pool_failure(429, "quota will reset after 4h", None);
+
+        assert_eq!(
+            openai_retry_action(&failure, 0),
+            OpenAiRetryAction::ReturnFailure
         );
     }
 

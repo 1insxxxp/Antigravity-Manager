@@ -17,15 +17,56 @@ use crate::proxy::upstream::client::mask_email;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
-use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+use super::pool_retry::{
+    classify_pool_failure, openai_retry_action, OpenAiRetryAction, PoolAttemptState, PoolFailure,
+    PoolFailureScope,
 };
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
 use crate::proxy::session_manager::SessionManager;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use std::collections::VecDeque;
 use tokio::time::Duration;
+
+fn openai_pool_error_response(
+    attempts: &PoolAttemptState,
+    mapped_model: &str,
+    account_email: Option<&str>,
+) -> Response {
+    let status =
+        StatusCode::from_u16(attempts.terminal_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let message = attempts
+        .last_failure()
+        .map(|failure| failure.sanitized_error.as_str())
+        .unwrap_or("No eligible upstream account was available");
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+                "code": status.as_u16()
+            }
+        })),
+    )
+        .into_response();
+
+    if let Ok(value) = HeaderValue::from_str(mapped_model) {
+        response.headers_mut().insert("X-Mapped-Model", value);
+    }
+    if let Some(email) = account_email {
+        if let Ok(value) = HeaderValue::from_str(email) {
+            response.headers_mut().insert("X-Account-Email", value);
+        }
+    }
+    if let Some(retry_after) = attempts.retry_after() {
+        if let Ok(value) = HeaderValue::from_str(retry_after) {
+            response.headers_mut().insert("Retry-After", value);
+        }
+    }
+
+    response
+}
 
 /// Return true only when a streamed chunk contains an actual error event.
 ///
@@ -474,8 +515,9 @@ pub async fn handle_chat_completions(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let mut pool_attempts = PoolAttemptState::new(pool_size);
+    let max_attempts = pool_attempts.max_account_attempts().max(1);
+    let mut signature_repair_attempted = false;
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -486,7 +528,13 @@ pub async fn handle_chat_completions(
         &*state.custom_mapping.read().await,
     );
 
-    for attempt in 0..max_attempts {
+    // One extra handler pass is reserved for the same-account signature repair.
+    // Account traversal is still capped by PoolAttemptState.
+    for attempt in 0..=max_attempts {
+        if pool_attempts.attempted_account_ids().len() >= max_attempts {
+            break;
+        }
+
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -508,11 +556,12 @@ pub async fn handle_chat_completions(
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 Some(&session_id),
                 &mapped_model,
+                pool_attempts.attempted_account_ids(),
             )
             .await
         {
@@ -528,6 +577,7 @@ pub async fn handle_chat_completions(
                     .into_response());
             }
         };
+        force_rotate = false;
 
         // [NEW v4.1.29] 获取完整 Token 对象用于动态规格查询
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -618,6 +668,7 @@ pub async fn handle_chat_completions(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                pool_attempts.record_failure(&account_id, PoolFailure::transport(&e));
                 debug!(
                     "OpenAI Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -759,6 +810,8 @@ pub async fn handle_chat_completions(
                 }
 
                 if retry_this_account {
+                    pool_attempts.record_failure(&account_id, PoolFailure::transport(&last_error));
+                    force_rotate = true;
                     continue; // Rotate to next account
                 }
 
@@ -1005,93 +1058,15 @@ pub async fn handle_chat_completions(
             .await;
         }
 
-        // 确定重试策略
-        let strategy = determine_retry_strategy(status_code, &error_text, false);
-
-        // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            // [FIX] Use async version with model parameter for fine-grained rate limiting
-            token_manager
-                .mark_rate_limited_async(
-                    &email,
-                    status_code,
-                    _retry_after.as_deref(),
-                    &error_text,
-                    Some(&mapped_model),
-                )
-                .await;
-        }
-
-        // 执行退避
-        if apply_retry_strategy(
-            strategy.clone(),
-            attempt,
-            max_attempts,
-            status_code,
-            &trace_id,
-        )
-        .await
-        {
-            // [NEW] Apply Client Adapter "let_it_crash" strategy
-            if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
-                    // For let_it_crash clients (like opencode), allow maybe 1 retry but then fail fast
-                    // to prevent long hangs on UI.
-                    tracing::warn!(
-                        "[OpenAI] let_it_crash active: Aborting retries after attempt {}",
-                        attempt
-                    );
-                    // Breaking loop to return error immediately
-                    // Reuse existing error return logic via loop exit behavior?
-                    // Or construct error here?
-                    // Let's just break for now, which will trigger the "All accounts exhausted" or last error logic.
-                    break;
-                }
-            }
-
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
-                debug!(
-                    "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
-                    trace_id, status_code
-                );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
-
-            // 2. [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED，允许账号轮换
-            // if error_text.contains("QUOTA_EXHAUSTED") { ... }
-            /*
-            if error_text.contains("QUOTA_EXHAUSTED") {
-                error!(
-                    "OpenAI Quota exhausted (429) on account {} attempt {}/{}, stopping to protect pool.",
-                    email,
-                    attempt + 1,
-                    max_attempts
-                );
-                return Ok((status, [("X-Account-Email", email.as_str()), ("X-Mapped-Model", mapped_model.as_str())], error_text).into_response());
-            }
-            */
-
-            // 3. 其他限流或服务器过载情况，轮换账号
-            tracing::warn!(
-                "OpenAI Upstream {} on {} attempt {}/{}, rotating account",
-                status_code,
-                email,
-                attempt + 1,
-                max_attempts
-            );
-            continue;
-        }
-
         // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
+        if !signature_repair_attempted
+            && status_code == 400
             && (error_text.contains("Invalid `signature`")
                 || error_text.contains("thinking.signature")
                 || error_text.contains("Invalid signature")
                 || error_text.contains("Corrupted thought signature"))
         {
+            signature_repair_attempted = true;
             tracing::warn!(
                 "[OpenAI] Signature error detected on account {}, retrying without thinking",
                 email
@@ -1122,106 +1097,81 @@ pub async fn handle_chat_completions(
             continue; // 重试
         }
 
-        // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
-        if status_code == 403 || status_code == 401 {
-            if apply_retry_strategy(
-                RetryStrategy::FixedDelay(Duration::from_millis(200)),
-                attempt,
-                max_attempts,
-                status_code,
-                &trace_id,
-            )
-            .await
-            {
-                continue;
-            }
-        }
+        let failure = classify_pool_failure(status_code, &error_text, _retry_after.as_deref());
+        pool_attempts.record_failure(&account_id, failure.clone());
+        let remaining = max_attempts.saturating_sub(pool_attempts.attempted_account_ids().len());
 
-        // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
-        if status_code == 403 || status_code == 401 {
-            // [NEW] 403 时设置 is_forbidden 状态，避免 Claude Code 会话退出
-            if status_code == 403 {
-                if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
-                    // Check for VALIDATION_REQUIRED error - temporarily block account
+        tracing::warn!(
+            trace_id = %trace_id,
+            account = %mask_email(&email),
+            scope = ?failure.scope,
+            attempted_accounts = pool_attempts.attempted_account_ids().len(),
+            max_account_attempts = max_attempts,
+            status = status_code,
+            "OpenAI upstream failure classified"
+        );
+
+        match openai_retry_action(&failure, remaining) {
+            OpenAiRetryAction::CooldownAndRotate => {
+                if failure.scope == PoolFailureScope::AccountModel {
+                    token_manager
+                        .mark_rate_limited_async(
+                            &email,
+                            status_code,
+                            _retry_after.as_deref(),
+                            &error_text,
+                            Some(&mapped_model),
+                        )
+                        .await;
+                }
+
+                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
                     if error_text.contains("VALIDATION_REQUIRED")
                         || error_text.contains("verify your account")
                         || error_text.contains("validation_url")
                     {
-                        tracing::warn!(
-                            "[OpenAI] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
-                            email
-                        );
-                        // Block for 10 minutes (default, configurable via config file)
-                        let block_minutes = 10i64;
-                        let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
-
+                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
                         if let Err(e) = token_manager
-                            .set_validation_block_public(&acc_id, block_until, &error_text)
+                            .set_validation_block_public(&account_id, block_until, &error_text)
                             .await
                         {
                             tracing::error!("Failed to set validation block: {}", e);
                         }
                     }
-
-                    // 设置 is_forbidden 状态
-                    if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
+                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
                         tracing::error!("Failed to set forbidden status: {}", e);
                     }
                 }
-            }
 
-            if apply_retry_strategy(
-                RetryStrategy::FixedDelay(Duration::from_millis(200)),
-                attempt,
-                max_attempts,
-                status_code,
-                &trace_id,
-            )
-            .await
-            {
+                if client_adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.let_it_crash() && attempt > 0)
+                {
+                    return Ok(openai_pool_error_response(
+                        &pool_attempts,
+                        &mapped_model,
+                        Some(&email),
+                    ));
+                }
+
+                force_rotate = true;
                 continue;
             }
+            OpenAiRetryAction::ReturnProviderStatus | OpenAiRetryAction::ReturnFailure => {
+                return Ok(openai_pool_error_response(
+                    &pool_attempts,
+                    &mapped_model,
+                    Some(&email),
+                ));
+            }
         }
-
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
-        error!(
-            "OpenAI Upstream non-retryable error {} on account {}: {}",
-            status_code, email, error_text
-        );
-        return Ok((
-            status,
-            [
-                ("X-Account-Email", email.as_str()),
-                ("X-Mapped-Model", mapped_model.as_str()),
-            ],
-            // [FIX] Return JSON error for better client compatibility
-            Json(json!({
-                "error": {
-                    "message": error_text,
-                    "type": "upstream_error",
-                    "code": status_code
-                }
-            })),
-        )
-            .into_response());
     }
 
-    // 所有尝试均失败
-    if let Some(email) = last_email {
-        Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    } else {
-        Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    }
+    Ok(openai_pool_error_response(
+        &pool_attempts,
+        &mapped_model,
+        last_email.as_deref(),
+    ))
 }
 
 // --- Codex GUIDANCE PROMPTS ---
@@ -2124,8 +2074,8 @@ pub async fn handle_completions(
 
     let upstream = state.upstream.clone();
     let pool_size = token_manager.len();
-    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let mut pool_attempts = PoolAttemptState::new(pool_size);
+    let max_attempts = pool_attempts.max_account_attempts().max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -2172,11 +2122,12 @@ pub async fn handle_completions(
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &mapped_model,
+                pool_attempts.attempted_account_ids(),
             )
             .await
         {
@@ -2190,7 +2141,6 @@ pub async fn handle_completions(
                     .into_response()
             }
         };
-
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
@@ -2285,6 +2235,8 @@ pub async fn handle_completions(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                pool_attempts.record_failure(&account_id, PoolFailure::transport(&e));
+                force_rotate = true;
                 debug!(
                     "Codex Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -2399,6 +2351,9 @@ pub async fn handle_completions(
                     }
 
                     if retry_this_account {
+                        pool_attempts
+                            .record_failure(&account_id, PoolFailure::transport(&last_error));
+                        force_rotate = true;
                         continue;
                     }
 
@@ -2513,6 +2468,9 @@ pub async fn handle_completions(
                         }
                     }
                     if retry_this_account {
+                        pool_attempts
+                            .record_failure(&account_id, PoolFailure::transport(&last_error));
+                        force_rotate = true;
                         continue;
                     }
 
@@ -2881,65 +2839,62 @@ pub async fn handle_completions(
             error_text
         );
 
-        // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
-            token_manager
-                .mark_rate_limited_async(
-                    &email,
-                    status_code,
-                    retry_after.as_deref(),
-                    &error_text,
-                    Some(&mapped_model),
-                )
-                .await;
-        }
+        let failure = classify_pool_failure(status_code, &error_text, retry_after.as_deref());
+        pool_attempts.record_failure(&account_id, failure.clone());
+        let remaining = max_attempts.saturating_sub(pool_attempts.attempted_account_ids().len());
 
-        // 确定重试策略
-        // 确定重试策略 (对齐官方 1.5s Grace Window)
-        let strategy = determine_retry_strategy(status_code, &error_text, false);
+        tracing::warn!(
+            trace_id = %trace_id,
+            account = %mask_email(&email),
+            scope = ?failure.scope,
+            attempted_accounts = pool_attempts.attempted_account_ids().len(),
+            max_account_attempts = max_attempts,
+            status = status_code,
+            "OpenAI Responses upstream failure classified"
+        );
 
-        // 执行退备
-        if apply_retry_strategy(
-            strategy.clone(),
-            attempt,
-            max_attempts,
-            status_code,
-            &trace_id,
-        )
-        .await
-        {
-            // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
-            continue;
-        } else {
-            // 不可重试
-            return (
-                status,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                error_text,
-            )
-                .into_response();
+        match openai_retry_action(&failure, remaining) {
+            OpenAiRetryAction::CooldownAndRotate => {
+                if failure.scope == PoolFailureScope::AccountModel {
+                    token_manager
+                        .mark_rate_limited_async(
+                            &email,
+                            status_code,
+                            retry_after.as_deref(),
+                            &error_text,
+                            Some(&mapped_model),
+                        )
+                        .await;
+                }
+
+                if failure.scope == PoolFailureScope::AccountAuth && status_code == 403 {
+                    if error_text.contains("VALIDATION_REQUIRED")
+                        || error_text.contains("verify your account")
+                        || error_text.contains("validation_url")
+                    {
+                        let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                        if let Err(e) = token_manager
+                            .set_validation_block_public(&account_id, block_until, &error_text)
+                            .await
+                        {
+                            tracing::error!("Failed to set validation block: {}", e);
+                        }
+                    }
+                    if let Err(e) = token_manager.set_forbidden(&account_id, &error_text).await {
+                        tracing::error!("Failed to set forbidden status: {}", e);
+                    }
+                }
+
+                force_rotate = true;
+                continue;
+            }
+            OpenAiRetryAction::ReturnProviderStatus | OpenAiRetryAction::ReturnFailure => {
+                return openai_pool_error_response(&pool_attempts, &mapped_model, Some(&email));
+            }
         }
     }
 
-    // 所有尝试均失败
-    if let Some(email) = last_email {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response()
-    }
+    openai_pool_error_response(&pool_attempts, &mapped_model, last_email.as_deref())
 }
 
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {
