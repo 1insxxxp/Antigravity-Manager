@@ -1,5 +1,8 @@
 ARG FRONTEND_IMAGE=antigravity-manager:latest
 
+# Reuse the already-built frontend both for Tauri compile-time validation and runtime assets.
+FROM ${FRONTEND_IMAGE} AS frontend-prebuilt
+
 # --- Backend Build Stage (no frontend build) ---
 FROM rust:1-slim-bookworm AS backend-builder
 ARG USE_MIRROR=auto
@@ -27,7 +30,17 @@ RUN apt-get update && apt-get install -y \
     librsvg2-dev \
     libsoup-3.0-dev \
     libjavascriptcoregtk-4.1-dev \
+    perl \
+    cmake \
+    golang-go \
+    clang \
+    libclang-dev \
+    git \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
+
+# BoringSSL requires Go and the native toolchain above during its Rust build.
+RUN which go && go version || (echo "ERROR: Go compiler not found" && exit 1)
 
 # Use Aliyun mirror for Cargo if needed (Sparse Index)
 ENV CARGO_HTTP_MULTIPLEXING=false
@@ -42,6 +55,7 @@ RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3
 WORKDIR /app
 COPY src-tauri ./src-tauri
 COPY src/locales ./src/locales
+COPY --from=frontend-prebuilt /app/dist ./dist
 
 WORKDIR /app/src-tauri
 RUN --mount=type=cache,target=/root/.cargo/registry \
@@ -49,9 +63,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/app/src-tauri/target \
     cargo build --release --bin antigravity_tools && \
     cp target/release/antigravity_tools /tmp/antigravity_tools
-
-# --- Frontend Dist Stage (reuse prebuilt image) ---
-FROM ${FRONTEND_IMAGE} AS frontend-prebuilt
 
 # --- Final Runtime Stage ---
 FROM debian:bookworm-slim
