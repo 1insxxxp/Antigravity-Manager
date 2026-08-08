@@ -1179,6 +1179,25 @@ impl TokenManager {
         session_id: Option<&str>,
         target_model: &str,
     ) -> Result<(String, String, String, String, u64), String> {
+        let excluded_account_ids = HashSet::new();
+        self.get_token_excluding(
+            quota_group,
+            force_rotate,
+            session_id,
+            target_model,
+            &excluded_account_ids,
+        )
+        .await
+    }
+
+    pub async fn get_token_excluding(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        excluded_account_ids: &HashSet<String>,
+    ) -> Result<(String, String, String, String, u64), String> {
         // [FIX] 检查并处理待重新加载的账号（配额保护同步）
         let pending_reload = crate::proxy::server::take_pending_reload_accounts();
         for account_id in pending_reload {
@@ -1206,7 +1225,13 @@ impl TokenManager {
         let timeout_duration = std::time::Duration::from_secs(5);
         match tokio::time::timeout(
             timeout_duration,
-            self.get_token_internal(quota_group, force_rotate, session_id, target_model),
+            self.get_token_internal(
+                quota_group,
+                force_rotate,
+                session_id,
+                target_model,
+                excluded_account_ids,
+            ),
         )
         .await
         {
@@ -1224,12 +1249,22 @@ impl TokenManager {
         force_rotate: bool,
         session_id: Option<&str>,
         target_model: &str,
+        excluded_account_ids: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
-        let mut total = tokens_snapshot.len();
-        if total == 0 {
+        if tokens_snapshot.is_empty() {
             return Err("Token pool is empty".to_string());
+        }
+
+        if let Some(session_id) = session_id {
+            let binding_is_excluded = self
+                .session_accounts
+                .get(session_id)
+                .is_some_and(|account_id| excluded_account_ids.contains(account_id.value()));
+            if binding_is_excluded {
+                self.session_accounts.remove(session_id);
+            }
         }
 
         // [NEW] 1. 动态能力过滤 (Capability Filter)
@@ -1264,6 +1299,12 @@ impl TokenManager {
             }
             return Err("Token pool is empty".to_string());
         }
+
+        tokens_snapshot.retain(|token| !excluded_account_ids.contains(&token.account_id));
+        if tokens_snapshot.is_empty() {
+            return Err("All eligible accounts were excluded for this request".to_string());
+        }
+        let mut total = tokens_snapshot.len();
 
         tokens_snapshot.sort_by(|a, b| {
             // Priority 0: 严格的订阅等级排序 (ULTRA > PRO > FREE)
@@ -3200,6 +3241,119 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    fn write_exclusion_test_account(
+        accounts_dir: &std::path::Path,
+        account_id: &str,
+        percentage: i64,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        let account_json = serde_json::json!({
+            "id": account_id,
+            "email": format!("{}@test.com", account_id),
+            "token": {
+                "access_token": format!("atk-{}", account_id),
+                "refresh_token": format!("rtk-{}", account_id),
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600,
+                "project_id": format!("pid-{}", account_id)
+            },
+            "quota": {
+                "models": [
+                    { "name": "gemini-2.5-pro", "percentage": percentage }
+                ]
+            },
+            "disabled": false,
+            "proxy_disabled": false,
+            "created_at": now,
+            "last_used": now
+        });
+
+        std::fs::write(
+            accounts_dir.join(format!("{}.json", account_id)),
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn exclusion_test_manager() -> (TokenManager, std::path::PathBuf) {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-exclusion-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        write_exclusion_test_account(&accounts_dir, "acc-1", 100);
+        write_exclusion_test_account(&accounts_dir, "acc-2", 90);
+        write_exclusion_test_account(&accounts_dir, "acc-3", 80);
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        (manager, tmp_root)
+    }
+
+    #[tokio::test]
+    async fn get_token_excluding_selects_an_unattempted_account() {
+        let (manager, tmp_root) = exclusion_test_manager().await;
+        let excluded = HashSet::from(["acc-1".to_string(), "acc-2".to_string()]);
+
+        let (_, _, _, selected_id, _) = manager
+            .get_token_excluding("gemini", true, Some("sid"), "gemini-2.5-pro", &excluded)
+            .await
+            .unwrap();
+
+        assert_eq!(selected_id, "acc-3");
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
+
+    #[tokio::test]
+    async fn get_token_excluding_unbinds_an_excluded_sticky_account() {
+        let (manager, tmp_root) = exclusion_test_manager().await;
+        manager
+            .session_accounts
+            .insert("sticky-sid".to_string(), "acc-1".to_string());
+        let excluded = HashSet::from(["acc-1".to_string(), "acc-2".to_string()]);
+
+        let (_, _, _, selected_id, _) = manager
+            .get_token_excluding(
+                "gemini",
+                false,
+                Some("sticky-sid"),
+                "gemini-2.5-pro",
+                &excluded,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(selected_id, "acc-3");
+        assert_ne!(
+            manager
+                .session_accounts
+                .get("sticky-sid")
+                .map(|value| value.clone()),
+            Some("acc-1".to_string())
+        );
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
+
+    #[tokio::test]
+    async fn get_token_excluding_reports_when_every_candidate_is_excluded() {
+        let (manager, tmp_root) = exclusion_test_manager().await;
+        let excluded = HashSet::from([
+            "acc-1".to_string(),
+            "acc-2".to_string(),
+            "acc-3".to_string(),
+        ]);
+
+        let error = manager
+            .get_token_excluding("gemini", true, Some("sid"), "gemini-2.5-pro", &excluded)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("excluded"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
 
     #[test]
     fn test_build_dynamic_model_candidates_agent() {
