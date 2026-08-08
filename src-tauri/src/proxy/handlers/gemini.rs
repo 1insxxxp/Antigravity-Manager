@@ -2,24 +2,69 @@
 use axum::{
     extract::State,
     extract::{Json, Path},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tracing::{debug, error, info};
 
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account,
+    apply_retry_strategy, determine_retry_strategy, RetryStrategy,
+};
+use crate::proxy::handlers::pool_retry::{
+    classify_pool_failure, gemini_retry_action, GeminiRetryAction, PoolAttemptState, PoolFailure,
+    PoolFailureScope,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
 use crate::proxy::session_manager::SessionManager;
 use crate::proxy::upstream::client::mask_email;
-use axum::http::HeaderMap;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+#[derive(Clone)]
+struct GeminiAccountContext {
+    access_token: String,
+    project_id: String,
+    email: String,
+    account_id: String,
+}
+
+fn gemini_error_response(
+    status_code: u16,
+    error_text: &str,
+    email: Option<&str>,
+    mapped_model: Option<&str>,
+    retry_after: Option<&str>,
+) -> Response {
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": error_text,
+                "status": "UPSTREAM_ERROR"
+            }
+        })),
+    )
+        .into_response();
+
+    if let Some(email) = email.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response.headers_mut().insert("x-account-email", email);
+    }
+    if let Some(model) = mapped_model.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response.headers_mut().insert("x-mapped-model", model);
+    }
+    if let Some(retry_after) = retry_after.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, retry_after);
+    }
+
+    response
+}
 
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
@@ -89,13 +134,30 @@ pub async fn handle_generate(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let mut pool_attempts = PoolAttemptState::new(pool_size);
+    let max_account_attempts = pool_attempts.max_account_attempts().max(1);
+    let max_request_attempts = max_account_attempts.saturating_mul(4).max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut last_mapped_model: Option<String> = None;
     let mut force_rotate = false;
+    let mut request_attempt = 0usize;
+    let mut selected_account_ids = HashSet::new();
+    let mut excluded_account_ids = HashSet::new();
+    let mut grace_retried_accounts = HashSet::new();
+    let mut signature_retried_accounts = HashSet::new();
+    let mut transport_retried_accounts = HashSet::new();
+    let mut stream_retried_accounts = HashSet::new();
+    let mut retry_account: Option<GeminiAccountContext> = None;
 
-    for attempt in 0..max_attempts {
+    while request_attempt < max_request_attempts {
+        if retry_account.is_none() && selected_account_ids.len() >= max_account_attempts {
+            break;
+        }
+        let attempt = request_attempt;
+        request_attempt = request_attempt.saturating_add(1);
+
         // 3. 模型路由解析
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &model_name,
@@ -132,31 +194,60 @@ pub async fn handle_generate(
         // 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-        // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
-                &config.request_type,
-                force_rotate,
-                Some(&session_id),
-                &config.final_model,
-            )
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Token error: {}", e),
-                ));
+        let account = if let Some(account) = retry_account.take() {
+            account
+        } else {
+            let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
+                .get_token_excluding(
+                    &config.request_type,
+                    force_rotate,
+                    Some(&session_id),
+                    &config.final_model,
+                    &excluded_account_ids,
+                )
+                .await
+            {
+                Ok(token) => token,
+                Err(error) if !selected_account_ids.is_empty() => {
+                    last_error = format!("Token error after pool attempts: {error}");
+                    break;
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Token error: {}", error),
+                    ));
+                }
+            };
+
+            selected_account_ids.insert(account_id.clone());
+            GeminiAccountContext {
+                access_token,
+                project_id,
+                email,
+                account_id,
             }
         };
+        let GeminiAccountContext {
+            access_token,
+            project_id,
+            email,
+            account_id,
+        } = account;
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
 
         last_email = Some(email.clone());
-        info!("✓ Using account: {} (type: {})", email, config.request_type);
+        last_mapped_model = Some(mapped_model.clone());
+        info!(
+            "✓ Using account: {} (type: {}, pool_attempt={}/{})",
+            mask_email(&email),
+            config.request_type,
+            selected_account_ids.len(),
+            max_account_attempts
+        );
 
         // 5. 包装请求 (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
@@ -225,12 +316,24 @@ pub async fn handle_generate(
             Err(e) => {
                 last_error = e.clone();
                 debug!(
-                    "Gemini Request failed on attempt {}/{}: {}",
+                    "Gemini transport failed on request attempt {}/{}: {}",
                     attempt + 1,
-                    max_attempts,
+                    max_request_attempts,
                     e
                 );
-                continue;
+                if transport_retried_accounts.insert(account_id.clone()) {
+                    retry_account = Some(GeminiAccountContext {
+                        access_token,
+                        project_id,
+                        email,
+                        account_id,
+                    });
+                    force_rotate = false;
+                    continue;
+                }
+
+                pool_attempts.record_failure(&account_id, PoolFailure::transport(&e));
+                break;
             }
         };
 
@@ -282,7 +385,6 @@ pub async fn handle_generate(
             // 6. 响应处理
             if is_stream {
                 use axum::body::Body;
-                use axum::response::Response;
                 use bytes::{Bytes, BytesMut};
                 use futures::StreamExt;
 
@@ -344,7 +446,22 @@ pub async fn handle_generate(
                 }
 
                 if retry_gemini {
-                    continue;
+                    if last_error.is_empty() {
+                        last_error = "Empty or incomplete upstream stream".to_string();
+                    }
+                    if stream_retried_accounts.insert(account_id.clone()) {
+                        retry_account = Some(GeminiAccountContext {
+                            access_token,
+                            project_id,
+                            email,
+                            account_id,
+                        });
+                        force_rotate = false;
+                        continue;
+                    }
+
+                    pool_attempts.record_failure(&account_id, PoolFailure::transport(&last_error));
+                    break;
                 }
 
                 let s_id_for_stream = s_id.clone();
@@ -576,6 +693,11 @@ pub async fn handle_generate(
 
         // 处理错误并重试
         let status_code = status.as_u16();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let error_text = response
             .text()
             .await
@@ -604,55 +726,17 @@ pub async fn handle_generate(
             .await;
         }
 
-        // 确定重试策略
-        let strategy = determine_retry_strategy(status_code, &error_text, false);
-        let trace_id = format!("gemini_{}", session_id);
-
-        // 执行退避
-        if apply_retry_strategy(
-            strategy.clone(),
-            attempt,
-            max_attempts,
-            status_code,
-            &trace_id,
-        )
-        .await
-        {
-            // [NEW] Apply Client Adapter "let_it_crash" strategy
-            if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
-                    tracing::warn!(
-                        "[Gemini] let_it_crash active: Aborting retries after attempt {}",
-                        attempt
-                    );
-                    break;
-                }
-            }
-
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
-                debug!(
-                "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
-                trace_id, status_code
-            );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
-
-            continue;
-        }
-
-        // [NEW] 处理 400 错误 (Thinking 签名失效)
+        // Thinking 签名修复属于同账号内部重试，不消耗另一个账号。
         if status_code == 400
             && (error_text.contains("Invalid `signature`")
                 || error_text.contains("thinking.signature")
                 || error_text.contains("Invalid signature")
                 || error_text.contains("Corrupted thought signature"))
+            && signature_retried_accounts.insert(account_id.clone())
         {
             tracing::warn!(
                 "[Gemini] Signature error detected on account {}, retrying without thinking",
-                email
+                mask_email(&email)
             );
 
             // 追加修复提示词到请求体的最后一条内容
@@ -669,46 +753,193 @@ pub async fn handle_generate(
                 }
             }
 
-            continue; // 重试
+            let _ = apply_retry_strategy(
+                RetryStrategy::FixedDelay(std::time::Duration::from_millis(200)),
+                0,
+                2,
+                status_code,
+                &trace_id,
+            )
+            .await;
+            retry_account = Some(GeminiAccountContext {
+                access_token,
+                project_id,
+                email,
+                account_id,
+            });
+            force_rotate = false;
+            continue;
         }
 
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
-        error!(
-            "Gemini Upstream non-retryable error {}: {}",
-            status_code, error_text
-        );
-        return Ok((
-            status,
-            [
-                ("X-Account-Email", email.as_str()),
-                ("X-Mapped-Model", mapped_model.as_str()),
-            ],
-            // [FIX] Return JSON error
-            Json(json!({
-                "error": {
-                    "code": status_code,
-                    "message": error_text,
-                    "status": "UPSTREAM_ERROR"
+        // 仅保留至多 2 秒的同账号 Grace Retry；长 Retry-After 直接进入切号。
+        let retry_strategy = determine_retry_strategy(status_code, &error_text, false);
+        if matches!(retry_strategy, RetryStrategy::GraceRetry(_))
+            && grace_retried_accounts.insert(account_id.clone())
+        {
+            let _ = apply_retry_strategy(retry_strategy, 0, 2, status_code, &trace_id).await;
+            retry_account = Some(GeminiAccountContext {
+                access_token,
+                project_id,
+                email,
+                account_id,
+            });
+            force_rotate = false;
+            continue;
+        }
+
+        let failure = classify_pool_failure(status_code, &error_text, retry_after.as_deref());
+        let failure_scope = failure.scope;
+        pool_attempts.record_failure(&account_id, failure.clone());
+
+        match failure_scope {
+            PoolFailureScope::AccountModel => {
+                token_manager
+                    .mark_rate_limited_async(
+                        &email,
+                        status_code,
+                        retry_after.as_deref(),
+                        &error_text,
+                        Some(&mapped_model),
+                    )
+                    .await;
+                excluded_account_ids.insert(account_id.clone());
+            }
+            PoolFailureScope::AccountAuth => {
+                let normalized_error = error_text.to_ascii_lowercase();
+                let requires_validation = normalized_error.contains("validation_required")
+                    || normalized_error.contains("verify your account")
+                    || normalized_error.contains("validation_url")
+                    || normalized_error.contains("validationurl");
+                if requires_validation {
+                    let block_until = chrono::Utc::now().timestamp() + 10 * 60;
+                    if let Err(error) = token_manager
+                        .set_validation_block_public(&account_id, block_until, &error_text)
+                        .await
+                    {
+                        tracing::error!(
+                            "[Gemini] Failed to set validation block for {}: {}",
+                            mask_email(&email),
+                            error
+                        );
+                    }
+                } else if status_code == 403 {
+                    if let Err(error) = token_manager.set_forbidden(&account_id, &error_text).await
+                    {
+                        tracing::error!(
+                            "[Gemini] Failed to mark forbidden account {}: {}",
+                            mask_email(&email),
+                            error
+                        );
+                    }
                 }
-            })),
-        )
-            .into_response());
+                excluded_account_ids.insert(account_id.clone());
+            }
+            PoolFailureScope::ProviderModel
+            | PoolFailureScope::Transport
+            | PoolFailureScope::Unknown => {}
+        }
+
+        if client_adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.let_it_crash() && attempt > 0)
+        {
+            tracing::warn!(
+                "[Gemini] let_it_crash active: returning upstream status after request attempt {}",
+                attempt + 1
+            );
+            return Ok(gemini_error_response(
+                status_code,
+                &error_text,
+                Some(&email),
+                Some(&mapped_model),
+                retry_after.as_deref(),
+            ));
+        }
+
+        let remaining_account_attempts =
+            max_account_attempts.saturating_sub(selected_account_ids.len());
+        match gemini_retry_action(&failure, remaining_account_attempts) {
+            GeminiRetryAction::CooldownAndRotate => {
+                tracing::warn!(
+                    protocol = "gemini",
+                    failure_scope = ?failure_scope,
+                    account = %mask_email(&email),
+                    account_attempts = selected_account_ids.len(),
+                    max_account_attempts,
+                    "Rotating account after account-scoped upstream failure"
+                );
+                force_rotate = true;
+                continue;
+            }
+            GeminiRetryAction::ReturnProviderStatus => {
+                tracing::warn!(
+                    protocol = "gemini",
+                    failure_scope = ?failure_scope,
+                    terminal_status = status_code,
+                    "Returning provider-scoped Gemini failure without account cooldown"
+                );
+                return Ok(gemini_error_response(
+                    status_code,
+                    &error_text,
+                    Some(&email),
+                    Some(&mapped_model),
+                    retry_after.as_deref(),
+                ));
+            }
+            GeminiRetryAction::ReturnFailure => {
+                if matches!(
+                    failure_scope,
+                    PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel
+                ) {
+                    break;
+                }
+
+                error!(
+                    "Gemini upstream non-retryable error {} (scope {:?})",
+                    status_code, failure_scope
+                );
+                return Ok(gemini_error_response(
+                    status_code,
+                    &error_text,
+                    Some(&email),
+                    Some(&mapped_model),
+                    retry_after.as_deref(),
+                ));
+            }
+        }
     }
 
-    if let Some(email) = last_email {
-        Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    } else {
-        Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    }
+    let terminal_status = pool_attempts.terminal_status();
+    let terminal_error = pool_attempts
+        .last_failure()
+        .map(|failure| failure.sanitized_error.as_str())
+        .filter(|error| !error.is_empty())
+        .unwrap_or_else(|| {
+            if last_error.is_empty() {
+                "No eligible AGM account could complete the request"
+            } else {
+                last_error.as_str()
+            }
+        });
+    let terminal_scope = pool_attempts.last_failure().map(|failure| failure.scope);
+    let pool_exhausted = pool_attempts.whole_pool_exhausted();
+    tracing::warn!(
+        protocol = "gemini",
+        failure_scope = ?terminal_scope,
+        account_attempts = selected_account_ids.len(),
+        max_account_attempts,
+        terminal_status,
+        pool_exhausted,
+        "Gemini pool request terminated"
+    );
+
+    Ok(gemini_error_response(
+        terminal_status,
+        terminal_error,
+        last_email.as_deref(),
+        last_mapped_model.as_deref(),
+        pool_attempts.retry_after(),
+    ))
 }
 
 pub async fn handle_list_models(

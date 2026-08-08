@@ -36,6 +36,13 @@ pub enum RetryDisposition {
     Return,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiRetryAction {
+    CooldownAndRotate,
+    ReturnProviderStatus,
+    ReturnFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolFailure {
     pub status: u16,
@@ -129,6 +136,12 @@ impl PoolAttemptState {
             return 429;
         }
 
+        if !self.attempted_account_ids.is_empty()
+            && self.account_limit_account_ids.len() == self.attempted_account_ids.len()
+        {
+            return 503;
+        }
+
         match self.last_failure.as_ref() {
             Some(failure)
                 if failure.scope != PoolFailureScope::Transport && failure.status != 0 =>
@@ -152,7 +165,7 @@ pub fn classify_pool_failure(
     retry_after: Option<&str>,
 ) -> PoolFailure {
     let normalized = error_text.to_ascii_lowercase();
-    let scope = if is_account_auth_failure(&normalized) {
+    let scope = if matches!(status, 401 | 403) || is_account_auth_failure(&normalized) {
         PoolFailureScope::AccountAuth
     } else if status == 429 && is_account_model_failure(&normalized) {
         PoolFailureScope::AccountModel
@@ -177,6 +190,24 @@ pub fn classify_pool_failure(
         disposition,
         retry_after: retry_after.map(str::to_owned),
         sanitized_error: sanitize_error(error_text),
+    }
+}
+
+pub fn gemini_retry_action(
+    failure: &PoolFailure,
+    remaining_account_attempts: usize,
+) -> GeminiRetryAction {
+    match failure.scope {
+        PoolFailureScope::AccountAuth | PoolFailureScope::AccountModel
+            if remaining_account_attempts > 0 =>
+        {
+            GeminiRetryAction::CooldownAndRotate
+        }
+        PoolFailureScope::ProviderModel => GeminiRetryAction::ReturnProviderStatus,
+        PoolFailureScope::AccountAuth
+        | PoolFailureScope::AccountModel
+        | PoolFailureScope::Transport
+        | PoolFailureScope::Unknown => GeminiRetryAction::ReturnFailure,
     }
 }
 
@@ -282,6 +313,26 @@ mod tests {
     }
 
     #[test]
+    fn gemini_account_429_marks_and_rotates() {
+        let failure = classify_pool_failure(429, "quota will reset after 4h", None);
+
+        assert_eq!(
+            gemini_retry_action(&failure, 9),
+            GeminiRetryAction::CooldownAndRotate
+        );
+    }
+
+    #[test]
+    fn gemini_provider_capacity_503_returns_without_long_backoff() {
+        let failure = classify_pool_failure(503, "No capacity available for model", None);
+
+        assert_eq!(
+            gemini_retry_action(&failure, 9),
+            GeminiRetryAction::ReturnProviderStatus
+        );
+    }
+
+    #[test]
     fn verification_failure_blocks_only_the_account() {
         let failure = classify_pool_failure(429, "Verify your account to continue.", None);
 
@@ -300,6 +351,16 @@ mod tests {
 
         assert_eq!(failure.scope, PoolFailureScope::AccountAuth);
         assert_eq!(failure.disposition, RetryDisposition::RotateAccount);
+    }
+
+    #[test]
+    fn authentication_statuses_are_account_scoped_without_marker_text() {
+        for status in [401, 403] {
+            let failure = classify_pool_failure(status, "upstream authentication failed", None);
+
+            assert_eq!(failure.scope, PoolFailureScope::AccountAuth);
+            assert_eq!(failure.disposition, RetryDisposition::RotateAccount);
+        }
     }
 
     #[test]
@@ -373,6 +434,7 @@ mod tests {
         }
 
         assert!(!state.whole_pool_exhausted());
+        assert_eq!(state.terminal_status(), 503);
     }
 
     #[test]
