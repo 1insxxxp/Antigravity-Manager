@@ -1824,7 +1824,7 @@ pub async fn handle_messages(
                     status_code,
                     retry_after.as_deref(),
                     &failure.sanitized_error,
-                    Some(&request_with_mapped.model),
+                    Some(&config.final_model),
                 )
                 .await;
         }
