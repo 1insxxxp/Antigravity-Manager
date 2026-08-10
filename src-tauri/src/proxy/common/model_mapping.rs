@@ -39,10 +39,12 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 
     // Claude Opus 4.6
     m.insert("claude-opus-4-6-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4.6-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4.6", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6-20260201", "claude-opus-4-6-thinking");
+    // Preserve the caller's native Opus 4.6 model instead of forcing the
+    // thinking variant. Older aliases above still redirect to Opus 4.6.
+    m.insert("claude-opus-4-6", "claude-opus-4-6");
+    m.insert("claude-opus-4.6-thinking", "claude-opus-4.6-thinking");
+    m.insert("claude-opus-4.6", "claude-opus-4.6");
+    m.insert("claude-opus-4-6-20260201", "claude-opus-4-6-20260201");
 
     m.insert("claude-haiku-4", "claude-sonnet-4-6");
     m.insert("claude-3-haiku-20240307", "claude-sonnet-4-6");
@@ -382,6 +384,14 @@ mod tests {
         assert_eq!(
             map_claude_model_to_gemini("claude-opus-4"),
             "claude-opus-4-6-thinking"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("claude-opus-4-6"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("claude-opus-4.6"),
+            "claude-opus-4.6"
         );
         // Test gemini pass-through (should not be caught by "mini" rule)
         assert_eq!(
