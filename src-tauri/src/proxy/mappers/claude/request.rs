@@ -1844,6 +1844,11 @@ fn build_generation_config(
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW]
 ) -> Value {
     let mut config = json!({});
+    let explicitly_disabled = claude_req
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.type_ == "disabled")
+        .unwrap_or(false);
 
     // Thinking 配置
     if is_thinking_enabled {
@@ -1974,6 +1979,11 @@ fn build_generation_config(
         }
 
         config["thinkingConfig"] = thinking_config;
+    } else if explicitly_disabled {
+        config["thinkingConfig"] = json!({
+            "includeThoughts": false,
+            "thinkingBudget": 0
+        });
     }
 
     // 其他参数
@@ -3016,6 +3026,40 @@ mod tests {
 
         // 5. Reset global mode
         crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
+    }
+
+    #[test]
+    fn test_plain_opus_disabled_state_emits_zero_budget_config() {
+        let req = ClaudeRequest {
+            model: "claude-opus-4-6-thinking".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Hello".to_string()),
+            }],
+            thinking: Some(ThinkingConfig {
+                type_: "disabled".to_string(),
+                budget_tokens: Some(0),
+                effort: None,
+            }),
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: false,
+            system: None,
+            tools: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result = transform_claude_request_in(&req, "proj", false, None, "test_session", None)
+            .expect("request conversion should succeed");
+        let thinking_config = &result["request"]["generationConfig"]["thinkingConfig"];
+
+        assert_eq!(thinking_config["includeThoughts"], false);
+        assert_eq!(thinking_config["thinkingBudget"], 0);
     }
 
     #[test]

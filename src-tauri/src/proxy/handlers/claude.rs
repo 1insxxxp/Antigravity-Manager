@@ -26,10 +26,57 @@ use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 
 fn should_expose_thinking_to_client(requested_model: &str) -> bool {
-    !matches!(
-        requested_model.trim().to_ascii_lowercase().as_str(),
-        "claude-opus-4-6" | "claude-opus-4.6" | "claude-opus-4-6-20260201"
-    )
+    opus_thinking_policy(requested_model) != OpusThinkingPolicy::PlainDisabled
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpusThinkingPolicy {
+    PlainDisabled,
+    ExplicitThinking,
+    Unchanged,
+}
+
+fn opus_thinking_policy(requested_model: &str) -> OpusThinkingPolicy {
+    match requested_model.trim().to_ascii_lowercase().as_str() {
+        "claude-opus-4-6" | "claude-opus-4.6" | "claude-opus-4-6-20260201" => {
+            OpusThinkingPolicy::PlainDisabled
+        }
+        "claude-opus-4-6-thinking" | "claude-opus-4.6-thinking" => {
+            OpusThinkingPolicy::ExplicitThinking
+        }
+        _ => OpusThinkingPolicy::Unchanged,
+    }
+}
+
+fn apply_opus_thinking_policy(request: &mut ClaudeRequest, policy: OpusThinkingPolicy) {
+    if policy != OpusThinkingPolicy::PlainDisabled {
+        return;
+    }
+
+    request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+        type_: "disabled".to_string(),
+        budget_tokens: Some(0),
+        effort: None,
+    });
+    request.output_config = None;
+
+    request.messages.retain_mut(|message| {
+        let MessageContent::Array(blocks) = &mut message.content else {
+            return true;
+        };
+
+        blocks.retain_mut(|block| match block {
+            crate::proxy::mappers::claude::models::ContentBlock::Thinking { .. }
+            | crate::proxy::mappers::claude::models::ContentBlock::RedactedThinking { .. } => false,
+            crate::proxy::mappers::claude::models::ContentBlock::ToolUse { signature, .. } => {
+                *signature = None;
+                true
+            }
+            _ => true,
+        });
+
+        !blocks.is_empty()
+    });
 }
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
@@ -452,6 +499,8 @@ pub async fn handle_messages(
                     .into_response();
             }
         };
+    let canonical_model = request.model.clone();
+    let opus_thinking_policy = opus_thinking_policy(&canonical_model);
 
     // [Task #6] Apply OpenCode variants thinking hints from raw JSON
     // 由于此时还没拿到账号，先用模型默认限额兜底
@@ -460,18 +509,21 @@ pub async fn handle_messages(
     apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
 
     // [Variant] Resolve canonical model + variant → real model + real params.
-    let client_budget = original_body
-        .get("thinking")
-        .and_then(|t| t.get("budget_tokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let client_budget = if opus_thinking_policy == OpusThinkingPolicy::PlainDisabled {
+        None
+    } else {
+        original_body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    };
     let effort_hint = request
         .output_config
         .as_ref()
         .and_then(|config| config.effort.clone());
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
-    let canonical_model = request.model.clone();
     let expose_thinking_to_client = should_expose_thinking_to_client(&canonical_model);
     if let Some(spec) = apply_variant(&mut request, effort_tier, client_budget) {
         tracing::info!(
@@ -479,6 +531,7 @@ pub async fn handle_messages(
             trace_id, canonical_model, effort_hint, client_budget, spec.id, spec.thinking_budget, spec.max_output_tokens
         );
     }
+    apply_opus_thinking_policy(&mut request, opus_thinking_policy);
 
     if debug_logger::is_enabled(&debug_cfg) {
         // [FIX] 使用原始 body 副本记录日志，确保不丢失任何字段
@@ -1976,9 +2029,103 @@ pub async fn handle_count_tokens(
 
 #[cfg(test)]
 mod opus_variant_tests {
-    use super::should_expose_thinking_to_client;
+    use super::{
+        apply_opus_thinking_policy, opus_thinking_policy, should_expose_thinking_to_client,
+        OpusThinkingPolicy,
+    };
     use crate::proxy::common::variant_mapping;
-    use crate::proxy::mappers::claude::models::ThinkingConfig;
+    use crate::proxy::mappers::claude::models::{
+        ClaudeRequest, ContentBlock, MessageContent, ThinkingConfig,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn plain_opus_aliases_select_disabled_policy() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4.6",
+            "claude-opus-4-6-20260201",
+        ] {
+            assert_eq!(
+                opus_thinking_policy(model),
+                OpusThinkingPolicy::PlainDisabled
+            );
+        }
+        assert_eq!(
+            opus_thinking_policy("claude-opus-4-6-thinking"),
+            OpusThinkingPolicy::ExplicitThinking
+        );
+        assert_eq!(
+            opus_thinking_policy("claude-sonnet-4-6"),
+            OpusThinkingPolicy::Unchanged
+        );
+    }
+
+    #[test]
+    fn plain_opus_policy_forces_zero_budget_and_removes_thinking_history() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 32000},
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "old reasoning", "signature": "old-signature"},
+                    {"type": "redacted_thinking", "data": "redacted reasoning"},
+                    {"type": "text", "text": "visible answer"},
+                    {"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}, "signature": "tool-signature"}
+                ]
+            }, {
+                "role": "user",
+                "content": "continue"
+            }]
+        }))
+        .expect("fixture should deserialize");
+
+        apply_opus_thinking_policy(&mut request, OpusThinkingPolicy::PlainDisabled);
+
+        let thinking = request
+            .thinking
+            .expect("disabled config should be explicit");
+        assert_eq!(thinking.type_, "disabled");
+        assert_eq!(thinking.budget_tokens, Some(0));
+        let MessageContent::Array(blocks) = &request.messages[0].content else {
+            panic!("assistant content should remain an array");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "visible answer"));
+        assert!(matches!(
+            &blocks[1],
+            ContentBlock::ToolUse { signature, .. } if signature.is_none()
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_policy_preserves_client_config_and_history() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning", "signature": "signature"},
+                    {"type": "text", "text": "answer"}
+                ]
+            }]
+        }))
+        .expect("fixture should deserialize");
+
+        apply_opus_thinking_policy(&mut request, OpusThinkingPolicy::ExplicitThinking);
+
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(8192)
+        );
+        let MessageContent::Array(blocks) = &request.messages[0].content else {
+            panic!("assistant content should remain an array");
+        };
+        assert_eq!(blocks.len(), 2);
+    }
 
     #[test]
     fn plain_opus_46_aliases_hide_upstream_thinking() {
