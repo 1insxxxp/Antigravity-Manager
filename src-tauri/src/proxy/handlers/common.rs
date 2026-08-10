@@ -65,6 +65,11 @@ pub fn determine_retry_strategy(
             }
         }
 
+        // 模型容量不足通常是账号/节点相关，短暂等待后立即轮换账号
+        503 if is_model_capacity_error(error_text) => {
+            RetryStrategy::FixedDelay(Duration::from_millis(500))
+        }
+
         // 503 服务不可用 / 529 服务器过载
         503 | 529 => {
             // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
@@ -176,6 +181,108 @@ pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>)
         // 503/529 通常是后端过载，切号效果有限，暂不轮换
         503 | 529 => false,
         _ => false,
+    }
+}
+
+fn value_contains_model_capacity_error(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let normalized = text.to_ascii_lowercase();
+            normalized.contains("model_capacity_exhausted")
+                || normalized.contains("image_capacity_exhausted")
+                || normalized.contains("no capacity available for model")
+        }
+        Value::Array(items) => items.iter().any(value_contains_model_capacity_error),
+        Value::Object(fields) => fields.values().any(value_contains_model_capacity_error),
+        _ => false,
+    }
+}
+
+pub fn is_model_capacity_error(error_text: &str) -> bool {
+    let json_start = error_text.find('{').unwrap_or(0);
+    if let Ok(value) = serde_json::from_str::<Value>(&error_text[json_start..]) {
+        if value_contains_model_capacity_error(&value) {
+            return true;
+        }
+    }
+
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("model_capacity_exhausted")
+        || normalized.contains("image_capacity_exhausted")
+        || normalized.contains("no capacity available for model")
+}
+
+pub fn should_rotate_account_for_error(
+    status_code: u16,
+    strategy: Option<&RetryStrategy>,
+    error_text: &str,
+) -> bool {
+    if status_code == 503 && is_model_capacity_error(error_text) {
+        return true;
+    }
+
+    should_rotate_account(status_code, strategy)
+}
+
+pub fn exhausted_response_status(last_status: Option<StatusCode>, last_error: &str) -> StatusCode {
+    if last_status == Some(StatusCode::SERVICE_UNAVAILABLE) && is_model_capacity_error(last_error) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::TOO_MANY_REQUESTS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotates_account_for_structured_model_capacity_503() {
+        let error = r#"{
+            "error": {
+                "code": 503,
+                "message": "No capacity available for model gemini-3.1-flash-image on the server",
+                "details": [{"reason": "MODEL_CAPACITY_EXHAUSTED"}]
+            }
+        }"#;
+
+        assert!(should_rotate_account_for_error(503, None, error));
+    }
+
+    #[test]
+    fn rotates_account_for_image_capacity_503() {
+        let error = r#"{"error":{"code":503,"details":[{"reason":"IMAGE_CAPACITY_EXHAUSTED"}]}}"#;
+
+        assert!(should_rotate_account_for_error(503, None, error));
+    }
+
+    #[test]
+    fn keeps_same_account_for_generic_503() {
+        let error = r#"{"error":{"code":503,"message":"Service temporarily unavailable"}}"#;
+
+        assert!(!should_rotate_account_for_error(503, None, error));
+    }
+
+    #[test]
+    fn quickly_retries_model_capacity_503() {
+        let error = "HTTP 503: No capacity available for model gemini-3.1-flash-image";
+
+        match determine_retry_strategy(503, error, false) {
+            RetryStrategy::FixedDelay(delay) => {
+                assert_eq!(delay, Duration::from_millis(500));
+            }
+            strategy => panic!("unexpected retry strategy: {strategy:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_service_unavailable_for_exhausted_model_capacity() {
+        let error = "HTTP 503: No capacity available for model gemini-3.1-flash-image";
+
+        assert_eq!(
+            exhausted_response_status(Some(StatusCode::SERVICE_UNAVAILABLE), error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 

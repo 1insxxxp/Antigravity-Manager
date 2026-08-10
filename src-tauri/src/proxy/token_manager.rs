@@ -1204,9 +1204,45 @@ impl TokenManager {
 
         // 【优化 Issue #284】添加 5 秒超时，防止死锁
         let timeout_duration = std::time::Duration::from_secs(5);
+        let excluded_account_ids = HashSet::new();
         match tokio::time::timeout(
             timeout_duration,
-            self.get_token_internal(quota_group, force_rotate, session_id, target_model),
+            self.get_token_internal(
+                quota_group,
+                force_rotate,
+                session_id,
+                target_model,
+                &excluded_account_ids,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(
+                "Token acquisition timeout (5s) - system too busy or deadlock detected".to_string(),
+            ),
+        }
+    }
+
+    /// 获取 Token，并排除当前请求中已经失败的账号。
+    pub async fn get_token_excluding(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        excluded_account_ids: &HashSet<String>,
+    ) -> Result<(String, String, String, String, u64), String> {
+        let timeout_duration = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(
+            timeout_duration,
+            self.get_token_internal(
+                quota_group,
+                force_rotate,
+                session_id,
+                target_model,
+                excluded_account_ids,
+            ),
         )
         .await
         {
@@ -1224,9 +1260,11 @@ impl TokenManager {
         force_rotate: bool,
         session_id: Option<&str>,
         target_model: &str,
+        excluded_account_ids: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
+        tokens_snapshot.retain(|token| !excluded_account_ids.contains(&token.account_id));
         let mut total = tokens_snapshot.len();
         if total == 0 {
             return Err("Token pool is empty".to_string());

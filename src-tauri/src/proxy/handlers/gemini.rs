@@ -6,12 +6,14 @@ use axum::{
     response::IntoResponse,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tracing::{debug, error, info};
 
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account,
+    apply_retry_strategy, determine_retry_strategy, exhausted_response_status,
+    should_rotate_account_for_error,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -92,8 +94,10 @@ pub async fn handle_generate(
     let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
+    let mut last_status: Option<StatusCode> = None;
     let mut last_email: Option<String> = None;
     let mut force_rotate = false;
+    let mut attempted_account_ids = HashSet::new();
 
     for attempt in 0..max_attempts {
         // 3. 模型路由解析
@@ -134,11 +138,12 @@ pub async fn handle_generate(
 
         // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 Some(&session_id),
                 &config.final_model,
+                &attempted_account_ids,
             )
             .await
         {
@@ -576,6 +581,7 @@ pub async fn handle_generate(
 
         // 处理错误并重试
         let status_code = status.as_u16();
+        last_status = Some(status);
         let error_text = response
             .text()
             .await
@@ -630,13 +636,14 @@ pub async fn handle_generate(
             }
 
             // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
+            if !should_rotate_account_for_error(status_code, Some(&strategy), &error_text) {
                 debug!(
                 "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
                 trace_id, status_code
             );
                 force_rotate = false;
             } else {
+                attempted_account_ids.insert(account_id.clone());
                 force_rotate = true;
             }
 
@@ -695,16 +702,17 @@ pub async fn handle_generate(
             .into_response());
     }
 
+    let response_status = exhausted_response_status(last_status, &last_error);
     if let Some(email) = last_email {
         Ok((
-            StatusCode::TOO_MANY_REQUESTS,
+            response_status,
             [("X-Account-Email", email)],
             format!("All accounts exhausted. Last error: {}", last_error),
         )
             .into_response())
     } else {
         Ok((
-            StatusCode::TOO_MANY_REQUESTS,
+            response_status,
             format!("All accounts exhausted. Last error: {}", last_error),
         )
             .into_response())
