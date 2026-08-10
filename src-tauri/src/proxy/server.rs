@@ -706,6 +706,7 @@ impl AxumServer {
             )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
+            .route("/accounts/:accountId/test", post(admin_test_account_model))
             .route("/system/data-dir", get(admin_get_data_dir_path))
             .route("/system/updates/settings", get(admin_get_update_settings))
             .route(
@@ -2507,6 +2508,21 @@ async fn admin_warm_up_account(
             )
         })?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct AccountModelTestRequest {
+    model: String,
+}
+
+async fn admin_test_account_model(
+    Path(account_id): Path<String>,
+    Json(payload): Json<AccountModelTestRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::modules::account::test_account_model_logic(&account_id, &payload.model)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))
 }
 
 async fn admin_save_http_api_settings(

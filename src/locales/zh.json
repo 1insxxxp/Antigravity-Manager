@@ -128,6 +128,18 @@
     "edit_label": "编辑标签",
     "custom_label_placeholder": "输入自定义标签",
     "label_updated": "标签已更新",
+    "model_test": {
+      "action": "测试模型",
+      "title": "账号模型测试",
+      "model": "选择模型",
+      "run": "开始测试",
+      "testing": "测试中",
+      "success": "调用成功",
+      "failed": "调用失败",
+      "elapsed": "响应耗时",
+      "no_models": "该账号没有模型数据，请先刷新额度。",
+      "empty_response": "上游返回了空响应"
+    },
     "add_account": "添加账号",
     "refresh_all": "刷新所有",
     "refresh_selected": "刷新 ({{count}})",

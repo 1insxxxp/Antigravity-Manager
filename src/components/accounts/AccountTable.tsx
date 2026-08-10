@@ -45,6 +45,7 @@ import {
     Bot,
     Repeat2,
     Terminal,
+    FlaskConical,
 } from 'lucide-react';
 import type { Account, ModelQuota } from '../../types/account';
 import { useTranslation } from 'react-i18next';
@@ -81,6 +82,7 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
+    onTest: (accountId: string) => void;
 }
 
 interface SortableRowProps {
@@ -101,6 +103,7 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    onTest: () => void;
 }
 
 interface AccountRowContentProps {
@@ -119,6 +122,7 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    onTest: () => void;
 }
 
 // ============================================================================
@@ -177,6 +181,7 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    onTest,
 }: SortableRowProps) {
     const { t } = useTranslation();
     const {
@@ -243,6 +248,7 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
+                onTest={onTest}
             />
         </tr>
     );
@@ -268,6 +274,7 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    onTest,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
@@ -616,6 +623,14 @@ function AccountRowContent({
                         </button>
                     )}
                     <button
+                        className={`p-1.5 rounded-lg transition-all ${isDisabled ? 'text-gray-300 cursor-not-allowed' : 'text-gray-500 dark:text-gray-400 hover:text-cyan-600 dark:hover:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-900/30'}`}
+                        onClick={(e) => { e.stopPropagation(); onTest(); }}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : t('accounts.model_test.action')}
+                        disabled={isDisabled}
+                    >
+                        <FlaskConical className="w-3.5 h-3.5" />
+                    </button>
+                    <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'bg-green-50 dark:bg-green-900/10 text-green-600 dark:text-green-400 cursor-not-allowed' : 'hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30'}`}
                         onClick={(e) => { e.stopPropagation(); onRefresh(); }}
                         title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.refreshing') : t('common.refresh'))}
@@ -686,6 +701,7 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    onTest,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
@@ -784,6 +800,7 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
+                                    onTest={() => onTest(account.id)}
                                 />
                             ))}
                         </tbody>
@@ -825,6 +842,7 @@ function AccountTable({
                                         onToggleProxy={() => { }}
                                         isDisabled={Boolean(activeAccount.disabled)}
                                         onViewError={() => { }}
+                                        onTest={() => { }}
                                     />
                                 </tr>
                             </tbody>

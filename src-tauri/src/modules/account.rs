@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
@@ -1969,6 +1969,163 @@ pub struct RefreshStats {
     pub details: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountModelTestResult {
+    pub account_id: String,
+    pub email: String,
+    pub model: String,
+    pub success: bool,
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    pub response: Option<String>,
+    pub error: Option<String>,
+}
+
+fn build_account_model_test_body(project_id: &str, model: &str) -> serde_json::Value {
+    let request = serde_json::json!({
+        "model": model,
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": "Reply with OK." }]
+        }],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 8
+        }
+    });
+
+    crate::proxy::mappers::gemini::wrap_request(
+        &request,
+        project_id,
+        model,
+        None,
+        Some(&uuid::Uuid::new_v4().to_string()),
+        None,
+    )
+}
+
+fn truncate_account_model_test_preview(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= 3 {
+        return ".".repeat(max_bytes);
+    }
+
+    let mut end = max_bytes - 3;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
+fn classify_account_model_test_response(
+    account_id: &str,
+    email: &str,
+    model: &str,
+    status: u16,
+    elapsed_ms: u64,
+    response_body: &str,
+) -> AccountModelTestResult {
+    let preview = truncate_account_model_test_preview(response_body, 4_000);
+    let success = (200..300).contains(&status);
+
+    AccountModelTestResult {
+        account_id: account_id.to_string(),
+        email: email.to_string(),
+        model: model.to_string(),
+        success,
+        status: Some(status),
+        elapsed_ms,
+        response: success.then_some(preview.clone()),
+        error: (!success).then_some(preview),
+    }
+}
+
+pub async fn test_account_model_logic(
+    account_id: &str,
+    model: &str,
+) -> Result<AccountModelTestResult, String> {
+    let account = load_account(account_id)?;
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("Model is required".to_string());
+    }
+    if account.disabled {
+        return Err(account
+            .disabled_reason
+            .clone()
+            .unwrap_or_else(|| "Account is disabled".to_string()));
+    }
+
+    let model_is_reported = account
+        .quota
+        .as_ref()
+        .map(|quota| quota.models.iter().any(|item| item.name == model))
+        .unwrap_or(false);
+    if !model_is_reported {
+        return Err(format!("Model {} is not reported for this account", model));
+    }
+
+    let (access_token, project_id) =
+        crate::modules::quota::get_valid_token_for_warmup(&account).await?;
+    let config = crate::modules::config::load_app_config()?;
+    let upstream = crate::proxy::upstream::client::UpstreamClient::new(
+        Some(config.proxy.upstream_proxy),
+        crate::proxy::proxy_pool::get_global_proxy_pool(),
+    );
+    let body = build_account_model_test_body(&project_id, model);
+    let started = std::time::Instant::now();
+
+    let call = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        upstream.call_v1_internal(
+            "generateContent",
+            &access_token,
+            body,
+            None,
+            Some(account_id),
+        ),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    match call {
+        Ok(Ok(call_result)) => {
+            let status = call_result.response.status().as_u16();
+            let body = call_result.response.text().await.unwrap_or_default();
+            Ok(classify_account_model_test_response(
+                account_id,
+                &account.email,
+                model,
+                status,
+                elapsed_ms,
+                &body,
+            ))
+        }
+        Ok(Err(error)) => Ok(AccountModelTestResult {
+            account_id: account_id.to_string(),
+            email: account.email,
+            model: model.to_string(),
+            success: false,
+            status: None,
+            elapsed_ms,
+            response: None,
+            error: Some(truncate_account_model_test_preview(&error, 4_000)),
+        }),
+        Err(_) => Ok(AccountModelTestResult {
+            account_id: account_id.to_string(),
+            email: account.email,
+            model: model.to_string(),
+            success: false,
+            status: None,
+            elapsed_ms,
+            response: None,
+            error: Some("Request timed out after 60 seconds".to_string()),
+        }),
+    }
+}
+
 /// Core logic to batch refresh all account quotas (decoupled from Tauri status)
 pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     use futures::future::join_all;
@@ -2102,5 +2259,49 @@ pub async fn check_and_trigger_warmup_for_recovered_models() {
 
         // Trigger warmup check for this account
         crate::modules::scheduler::trigger_warmup_for_account(&account).await;
+    }
+}
+
+#[cfg(test)]
+mod account_model_test_tests {
+    use super::*;
+
+    #[test]
+    fn builds_minimal_account_model_test_request() {
+        let body = build_account_model_test_body("project-123", "gemini-2.5-flash");
+
+        assert_eq!(body["project"], "project-123");
+        assert_eq!(body["model"], "gemini-2.5-flash");
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][0]["text"],
+            "Reply with OK."
+        );
+    }
+
+    #[test]
+    fn truncates_account_model_test_preview_on_utf8_boundary() {
+        let input = "测".repeat(1000);
+        let preview = truncate_account_model_test_preview(&input, 100);
+
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(preview.len() <= 100);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn classifies_non_success_status_as_failed_result() {
+        let result = classify_account_model_test_response(
+            "account-1",
+            "user@example.com",
+            "gemini-2.5-pro",
+            429,
+            321,
+            r#"{"error":{"message":"quota exceeded"}}"#,
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.status, Some(429));
+        assert_eq!(result.elapsed_ms, 321);
+        assert!(result.error.unwrap().contains("quota exceeded"));
     }
 }

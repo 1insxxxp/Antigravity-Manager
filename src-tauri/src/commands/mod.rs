@@ -1071,6 +1071,15 @@ pub async fn warm_up_account(account_id: String) -> Result<String, String> {
     modules::quota::warm_up_account(&account_id).await
 }
 
+/// Test one model using exactly one account without pool failover.
+#[tauri::command]
+pub async fn test_account_model(
+    account_id: String,
+    model: String,
+) -> Result<modules::account::AccountModelTestResult, String> {
+    modules::account::test_account_model_logic(&account_id, &model).await
+}
+
 /// 更新账号自定义标签
 #[tauri::command]
 pub async fn update_account_label(account_id: String, label: String) -> Result<(), String> {

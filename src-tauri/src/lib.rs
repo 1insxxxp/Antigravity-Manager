@@ -622,6 +622,7 @@ pub fn run() {
             // Warmup commands
             commands::warm_up_all_accounts,
             commands::warm_up_account,
+            commands::test_account_model,
             commands::update_account_label,
             // HTTP API settings commands
             commands::get_http_api_settings,

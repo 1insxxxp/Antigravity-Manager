@@ -167,6 +167,21 @@ struct BindDeviceResponse {
     device_profile: Option<DeviceProfileResponse>,
 }
 
+#[derive(Deserialize)]
+struct AccountModelTestRequest {
+    model: String,
+}
+
+async fn test_account_model(
+    Path(account_id): Path<String>,
+    Json(payload): Json<AccountModelTestRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    account::test_account_model_logic(&account_id, &payload.model)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))
+}
+
 #[derive(Serialize)]
 struct DeviceProfileResponse {
     machine_id: String,
@@ -486,6 +501,7 @@ pub async fn start_server(
         .route("/accounts/current", get(get_current_account))
         .route("/accounts/switch", post(switch_account))
         .route("/accounts/refresh", post(refresh_all_quotas))
+        .route("/accounts/{id}/test", post(test_account_model))
         .route("/accounts/{id}/bind-device", post(bind_device))
         .route("/logs", get(get_logs))
         .layer(cors)

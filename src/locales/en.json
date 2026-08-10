@@ -131,6 +131,18 @@
     "edit_label": "Edit Label",
     "custom_label_placeholder": "Enter custom label",
     "label_updated": "Label updated",
+    "model_test": {
+      "action": "Test model",
+      "title": "Account model test",
+      "model": "Model",
+      "run": "Run test",
+      "testing": "Testing",
+      "success": "Request succeeded",
+      "failed": "Request failed",
+      "elapsed": "Elapsed",
+      "no_models": "No model data is available. Refresh quota first.",
+      "empty_response": "The upstream returned an empty response"
+    },
     "add_account": "Add Account",
     "refresh_all": "Refresh All",
     "refresh_selected": "Refresh ({{count}})",

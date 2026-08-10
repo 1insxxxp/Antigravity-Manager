@@ -202,6 +202,21 @@ export async function warmUpAccount(accountId: string): Promise<string> {
     return await invoke('warm_up_account', { accountId });
 }
 
+export interface AccountModelTestResult {
+    account_id: string;
+    email: string;
+    model: string;
+    success: boolean;
+    status?: number;
+    elapsed_ms: number;
+    response?: string;
+    error?: string;
+}
+
+export async function testAccountModel(accountId: string, model: string): Promise<AccountModelTestResult> {
+    return await invoke('test_account_model', { accountId, model });
+}
+
 // 导出账号相关
 export interface ExportAccountItem {
     email: string;
@@ -220,4 +235,3 @@ export async function exportAccounts(accountIds: string[]): Promise<ExportAccoun
 export async function updateAccountLabel(accountId: string, label: string): Promise<void> {
     return await invoke('update_account_label', { accountId, label });
 }
-
