@@ -140,11 +140,8 @@ pub fn resolve_non_variant_model(model: &str) -> Option<RealModelSpec> {
     if key == "claude-sonnet-4-6" {
         return Some(SPEC_CLAUDE_SONNET_46);
     }
-    if key == "claude-opus-4-6-thinking" {
+    if matches!(key.as_str(), "claude-opus-4-6-thinking" | "claude-opus-4-6") {
         return Some(SPEC_CLAUDE_OPUS_46);
-    }
-    if key == "claude-opus-4-6" {
-        return Some(SPEC_CLAUDE_OPUS_46_NATIVE);
     }
     if key == "gpt-oss-120b-medium" {
         return Some(SPEC_GPT_OSS_120B);
@@ -226,13 +223,6 @@ const SPEC_CLAUDE_SONNET_46: RealModelSpec = RealModelSpec {
 };
 const SPEC_CLAUDE_OPUS_46: RealModelSpec = RealModelSpec {
     id: "claude-opus-4-6-thinking",
-    thinking_budget: 1024,
-    max_output_tokens: 64000,
-    include_thoughts: true,
-    preserve_client_budget: true,
-};
-const SPEC_CLAUDE_OPUS_46_NATIVE: RealModelSpec = RealModelSpec {
-    id: "claude-opus-4-6",
     thinking_budget: 1024,
     max_output_tokens: 64000,
     include_thoughts: true,
@@ -718,7 +708,7 @@ mod tests {
 
         // ── Claude family ──────────────────────────────────────────────
         check("claude-sonnet-4-6", None, "claude-sonnet-4-6", 1024, 64000);
-        // Native and thinking Opus variants must preserve their requested IDs.
+        // Native Opus 4.6 is an alias for the supported thinking model.
         check(
             "claude-opus-4-6-thinking",
             None,
@@ -729,7 +719,7 @@ mod tests {
         check(
             "claude-opus-4-6",
             None,
-            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
             1024,
             64000,
         );
