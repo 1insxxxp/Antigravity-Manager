@@ -234,6 +234,7 @@ pub struct StreamingState {
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
     // [FIX #MCP] Registered tool names for fuzzy matching
     pub registered_tool_names: Vec<String>,
+    expose_thinking: bool,
 }
 
 impl StreamingState {
@@ -263,6 +264,7 @@ impl StreamingState {
             message_count: 0,
             client_adapter: None,
             registered_tool_names: Vec::new(),
+            expose_thinking: true,
         }
     }
 
@@ -274,6 +276,10 @@ impl StreamingState {
     // [FIX #MCP] Set registered tool names for fuzzy matching
     pub fn set_registered_tool_names(&mut self, names: Vec<String>) {
         self.registered_tool_names = names;
+    }
+
+    pub fn set_expose_thinking(&mut self, expose_thinking: bool) {
+        self.expose_thinking = expose_thinking;
     }
 
     /// 发送 SSE 事件
@@ -655,7 +661,7 @@ impl<'a> PartProcessor<'a> {
     pub fn process(&mut self, part: &GeminiPart) -> Vec<Bytes> {
         let mut chunks = Vec::new();
         // [FIX #545] Decode Base64 signature if present (Gemini sends Base64, Claude expects Raw)
-        let signature = part.thought_signature.as_ref().map(|sig| {
+        let decoded_signature = part.thought_signature.as_ref().map(|sig| {
             // Try to decode as base64
             use base64::Engine;
             match base64::engine::general_purpose::STANDARD.decode(sig) {
@@ -675,6 +681,22 @@ impl<'a> PartProcessor<'a> {
                 Err(_) => sig.clone(), // Not base64, keep as is
             }
         });
+
+        if !self.state.expose_thinking {
+            if let Some(signature) = decoded_signature.as_deref() {
+                self.cache_thinking_signature(signature);
+            }
+            if part.thought.unwrap_or(false) {
+                self.state.has_thinking = true;
+                return chunks;
+            }
+        }
+
+        let signature = self
+            .state
+            .expose_thinking
+            .then_some(decoded_signature)
+            .flatten();
 
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
@@ -788,34 +810,12 @@ impl<'a> PartProcessor<'a> {
 
         // [IMPROVED] Store signature to global cache
         if let Some(ref sig) = signature {
-            // 1. Cache family if we know the model
-            if let Some(model) = &self.state.model_name {
-                SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
-            }
-
-            // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
-            if let Some(session_id) = &self.state.session_id {
-                // If FIFO strategy is enabled, use a unique index for each signature (e.g. timestamp or counter)
-                // However, our cache implementation currently keys by session_id.
-                // For FIFO, we might just rely on the fact that we are processing in order.
-                // But specifically for opencode, it might be calling tools in parallel or sequence.
-
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-                tracing::debug!(
-                    "[Claude-SSE] Cached signature to session {} (length: {}) [FIFO: {}]",
-                    session_id,
-                    sig.len(),
-                    use_fifo
-                );
-            }
+            self.cache_thinking_signature(sig);
 
             tracing::debug!(
-                "[Claude-SSE] Captured thought_signature from thinking block (length: {})",
-                sig.len()
+                "[Claude-SSE] Captured thought_signature from thinking block (length: {}) [FIFO: {}]",
+                sig.len(),
+                use_fifo
             );
         }
 
@@ -826,6 +826,25 @@ impl<'a> PartProcessor<'a> {
         self.state.store_signature(signature);
 
         chunks
+    }
+
+    fn cache_thinking_signature(&self, signature: &str) {
+        if let Some(model) = &self.state.model_name {
+            SignatureCache::global().cache_thinking_family(signature.to_string(), model.clone());
+        }
+
+        if let Some(session_id) = &self.state.session_id {
+            SignatureCache::global().cache_session_signature(
+                session_id,
+                signature.to_string(),
+                self.state.message_count,
+            );
+            tracing::debug!(
+                "[Claude-SSE] Cached signature to session {} (length: {})",
+                session_id,
+                signature.len()
+            );
+        }
     }
 
     /// 处理普通 Text
@@ -1257,6 +1276,82 @@ mod tests {
 
         // 3. content_block_stop
         assert!(output.contains(r#""type":"content_block_stop""#));
+    }
+
+    #[test]
+    fn hidden_thinking_emits_no_thinking_events_or_signatures() {
+        let mut state = StreamingState::new();
+        state.set_expose_thinking(false);
+        state.session_id = Some("hidden-thinking-cache-test".to_string());
+        state.model_name = Some("claude-opus-4-6-thinking".to_string());
+        state.message_count = 3;
+        let raw_signature = "hidden-signature-value".repeat(8);
+        let encoded_signature = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw_signature)
+        };
+        let mut processor = PartProcessor::new(&mut state);
+
+        let thought_chunks = processor.process(&GeminiPart {
+            text: Some("private reasoning".to_string()),
+            thought: Some(true),
+            thought_signature: Some(encoded_signature),
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+        });
+        let text_chunks = processor.process(&GeminiPart {
+            text: Some("visible answer".to_string()),
+            thought: None,
+            thought_signature: None,
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+        });
+
+        let output = thought_chunks
+            .iter()
+            .chain(text_chunks.iter())
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<String>();
+
+        assert!(!output.contains("thinking_delta"));
+        assert!(!output.contains("signature_delta"));
+        assert!(!output.contains("private reasoning"));
+        assert!(!output.contains("private-signature"));
+        assert!(output.contains("text_delta"));
+        assert!(output.contains("visible answer"));
+        assert_eq!(
+            SignatureCache::global().get_session_signature("hidden-thinking-cache-test"),
+            Some(raw_signature.clone())
+        );
+        assert_eq!(
+            SignatureCache::global().get_signature_family(&raw_signature),
+            Some("claude-opus-4-6-thinking".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_thinking_still_emits_thinking_events() {
+        let mut state = StreamingState::new();
+        state.set_expose_thinking(true);
+        let mut processor = PartProcessor::new(&mut state);
+
+        let chunks = processor.process(&GeminiPart {
+            text: Some("visible reasoning".to_string()),
+            thought: Some(true),
+            thought_signature: Some("visible-signature".to_string()),
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+        });
+        let output = chunks
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<String>();
+
+        assert!(output.contains("thinking_delta"));
+        assert!(output.contains("visible reasoning"));
     }
 
     #[test]

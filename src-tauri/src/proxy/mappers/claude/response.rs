@@ -158,10 +158,20 @@ pub struct NonStreamingProcessor {
     pub session_id: Option<String>,
     pub model_name: String,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
+    expose_thinking: bool,
 }
 
 impl NonStreamingProcessor {
     pub fn new(session_id: Option<String>, model_name: String, message_count: usize) -> Self {
+        Self::with_thinking_visibility(session_id, model_name, message_count, true)
+    }
+
+    pub fn with_thinking_visibility(
+        session_id: Option<String>,
+        model_name: String,
+        message_count: usize,
+        expose_thinking: bool,
+    ) -> Self {
         Self {
             content_blocks: Vec::new(),
             text_builder: String::new(),
@@ -174,6 +184,7 @@ impl NonStreamingProcessor {
             session_id,
             model_name,
             message_count,
+            expose_thinking,
         }
     }
 
@@ -227,7 +238,7 @@ impl NonStreamingProcessor {
 
     /// 处理单个 part
     fn process_part(&mut self, part: &GeminiPart) {
-        let signature = part.thought_signature.as_ref().map(|sig| {
+        let decoded_signature = part.thought_signature.as_ref().map(|sig| {
             use base64::Engine;
             match base64::engine::general_purpose::STANDARD.decode(sig) {
                 Ok(decoded_bytes) => {
@@ -248,7 +259,7 @@ impl NonStreamingProcessor {
         });
 
         // [FIX #765] Cache signature in NonStreamingProcessor
-        if let Some(sig) = &signature {
+        if let Some(sig) = &decoded_signature {
             if let Some(s_id) = &self.session_id {
                 crate::proxy::SignatureCache::global().cache_session_signature(
                     s_id,
@@ -264,6 +275,12 @@ impl NonStreamingProcessor {
                 );
             }
         }
+
+        if part.thought.unwrap_or(false) && !self.expose_thinking {
+            return;
+        }
+
+        let signature = self.expose_thinking.then_some(decoded_signature).flatten();
 
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
@@ -552,6 +569,24 @@ pub fn transform_response(
     Ok(processor.process(gemini_response, scaling_enabled, context_limit))
 }
 
+pub fn transform_response_with_thinking_visibility(
+    gemini_response: &GeminiResponse,
+    scaling_enabled: bool,
+    context_limit: u32,
+    session_id: Option<String>,
+    model_name: String,
+    message_count: usize,
+    expose_thinking: bool,
+) -> Result<ClaudeResponse, String> {
+    let mut processor = NonStreamingProcessor::with_thinking_visibility(
+        session_id,
+        model_name,
+        message_count,
+        expose_thinking,
+    );
+    Ok(processor.process(gemini_response, scaling_enabled, context_limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +708,57 @@ mod tests {
             }
             _ => panic!("Expected Text block"),
         }
+    }
+
+    #[test]
+    fn test_hidden_thinking_returns_only_visible_text() {
+        let gemini_resp = GeminiResponse {
+            candidates: Some(vec![Candidate {
+                content: Some(GeminiContent {
+                    role: "model".to_string(),
+                    parts: vec![
+                        GeminiPart {
+                            text: Some("private reasoning".to_string()),
+                            thought: Some(true),
+                            thought_signature: Some("private-signature".to_string()),
+                            function_call: None,
+                            function_response: None,
+                            inline_data: None,
+                        },
+                        GeminiPart {
+                            text: Some("visible answer".to_string()),
+                            thought: None,
+                            thought_signature: None,
+                            function_call: None,
+                            function_response: None,
+                            inline_data: None,
+                        },
+                    ],
+                }),
+                finish_reason: Some("STOP".to_string()),
+                index: Some(0),
+                grounding_metadata: None,
+            }]),
+            usage_metadata: None,
+            model_version: Some("claude-opus-4-6-thinking".to_string()),
+            response_id: Some("resp_hidden_thinking".to_string()),
+        };
+
+        let result = transform_response_with_thinking_visibility(
+            &gemini_resp,
+            false,
+            200_000,
+            None,
+            "claude-opus-4-6-thinking".to_string(),
+            1,
+            false,
+        )
+        .expect("response conversion should succeed");
+
+        assert_eq!(result.content.len(), 1);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "visible answer"
+        ));
     }
 }

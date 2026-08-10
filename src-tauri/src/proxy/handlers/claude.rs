@@ -18,12 +18,19 @@ use crate::proxy::mappers::claude::{
     clean_cache_control_from_messages, close_tool_loop_for_thinking, create_claude_sse_stream,
     filter_invalid_thinking_blocks_with_family, merge_consecutive_messages,
     models::{Message, MessageContent},
-    transform_claude_request_in, transform_response, ClaudeRequest,
+    transform_claude_request_in, transform_response_with_thinking_visibility, ClaudeRequest,
 };
 use crate::proxy::mappers::context_manager::ContextManager;
 use crate::proxy::mappers::estimation_calibrator::get_calibrator;
 use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
+
+fn should_expose_thinking_to_client(requested_model: &str) -> bool {
+    !matches!(
+        requested_model.trim().to_ascii_lowercase().as_str(),
+        "claude-opus-4-6" | "claude-opus-4.6" | "claude-opus-4-6-20260201"
+    )
+}
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 use std::sync::{atomic::Ordering, Arc}; // [NEW]
@@ -465,6 +472,7 @@ pub async fn handle_messages(
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
+    let expose_thinking_to_client = should_expose_thinking_to_client(&canonical_model);
     if let Some(spec) = apply_variant(&mut request, effort_tier, client_budget) {
         tracing::info!(
             "[{}] [Variant] canonical='{}' effort_hint={:?} budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
@@ -1309,6 +1317,7 @@ pub async fn handle_messages(
                     current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                     client_adapter.clone(), // [NEW] Pass client adapter
                     registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
+                    expose_thinking_to_client,
                 );
 
                 let mut first_data_chunk = None;
@@ -1517,13 +1526,14 @@ pub async fn handle_messages(
                 // [FIX #765] Pass session_id and model_name for signature caching
                 let s_id_owned = session_id.map(|s| s.to_string());
                 // 转换
-                let claude_response = match transform_response(
+                let claude_response = match transform_response_with_thinking_visibility(
                     &gemini_response,
                     scaling_enabled,
                     context_limit,
                     s_id_owned,
                     request_with_mapped.model.clone(),
                     request_with_mapped.messages.len(), // [NEW v4.0.0] Pass message count for rewind detection
+                    expose_thinking_to_client,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1966,8 +1976,24 @@ pub async fn handle_count_tokens(
 
 #[cfg(test)]
 mod opus_variant_tests {
+    use super::should_expose_thinking_to_client;
     use crate::proxy::common::variant_mapping;
     use crate::proxy::mappers::claude::models::ThinkingConfig;
+
+    #[test]
+    fn plain_opus_46_aliases_hide_upstream_thinking() {
+        assert!(!should_expose_thinking_to_client("claude-opus-4-6"));
+        assert!(!should_expose_thinking_to_client("claude-opus-4.6"));
+        assert!(!should_expose_thinking_to_client(
+            "claude-opus-4-6-20260201"
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_and_other_models_keep_thinking_visible() {
+        assert!(should_expose_thinking_to_client("claude-opus-4-6-thinking"));
+        assert!(should_expose_thinking_to_client("claude-sonnet-4-6"));
+    }
 
     #[test]
     fn claude_opus_preserves_client_budget_when_present() {
