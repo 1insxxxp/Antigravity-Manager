@@ -116,7 +116,11 @@ export default function AccountTestModal({ account, onClose }: AccountTestModalP
 
                 <footer className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100 dark:border-base-200 bg-gray-50 dark:bg-base-200/50">
                     <button className="btn btn-sm btn-ghost" onClick={onClose}>{t('common.close')}</button>
-                    <button className="btn btn-sm btn-info text-white min-w-24" onClick={runTest} disabled={!model || testing}>
+                    <button
+                        className="inline-flex h-9 min-w-28 items-center justify-center gap-2 rounded-lg bg-cyan-600 px-4 text-sm font-medium text-white transition-colors hover:bg-cyan-700 disabled:cursor-not-allowed disabled:bg-cyan-200 disabled:text-white dark:disabled:bg-cyan-950"
+                        onClick={runTest}
+                        disabled={!model || testing}
+                    >
                         {testing ? <LoaderCircle className="w-4 h-4 animate-spin" /> : <FlaskConical className="w-4 h-4" />}
                         {testing ? t('accounts.model_test.testing') : t('accounts.model_test.run')}
                     </button>
