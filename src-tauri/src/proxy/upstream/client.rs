@@ -55,7 +55,13 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
 
     // 限制长度防止日志炸弹
     if redacted.len() > 1000 {
-        format!("{}... (truncated)", &redacted[..1000])
+        let cutoff = redacted
+            .char_indices()
+            .take_while(|(idx, _)| *idx < 1000)
+            .map(|(idx, _)| idx)
+            .last()
+            .unwrap_or(0);
+        format!("{}... (truncated)", &redacted[..cutoff])
     } else {
         redacted.into_owned()
     }
@@ -474,15 +480,10 @@ impl UpstreamClient {
                             let error_text = String::from_utf8_lossy(&response_body);
 
                             if has_next
-                                && Self::should_try_next_endpoint_for_response(
-                                    status,
-                                    &error_text,
-                                )
+                                && Self::should_try_next_endpoint_for_response(status, &error_text)
                             {
-                                let err_msg = format!(
-                                    "Upstream {} rejected the request location",
-                                    base_url
-                                );
+                                let err_msg =
+                                    format!("Upstream {} rejected the request location", base_url);
                                 tracing::warn!(
                                     "Unsupported location at {} (method={}), trying next endpoint",
                                     base_url,
@@ -500,13 +501,12 @@ impl UpstreamClient {
                             let mut rebuilt = axum::http::Response::builder()
                                 .status(status)
                                 .version(version);
-                            *rebuilt
-                                .headers_mut()
-                                .ok_or_else(|| "Failed to rebuild upstream headers".to_string())? =
-                                response_headers;
-                            let rebuilt = rebuilt
-                                .body(response_body)
-                                .map_err(|e| format!("Failed to rebuild upstream response: {}", e))?;
+                            *rebuilt.headers_mut().ok_or_else(|| {
+                                "Failed to rebuild upstream headers".to_string()
+                            })? = response_headers;
+                            let rebuilt = rebuilt.body(response_body).map_err(|e| {
+                                format!("Failed to rebuild upstream response: {}", e)
+                            })?;
                             return Ok(UpstreamCallResult {
                                 response: rebuilt.into(),
                                 fallback_attempts,
@@ -638,7 +638,8 @@ mod tests {
 
     #[test]
     fn falls_back_only_for_unsupported_location_bad_request() {
-        let unsupported = r#"{"error":{"code":400,"message":"User location is not supported for the API use."}}"#;
+        let unsupported =
+            r#"{"error":{"code":400,"message":"User location is not supported for the API use."}}"#;
         let invalid = r#"{"error":{"code":400,"message":"Invalid request body"}}"#;
 
         assert!(UpstreamClient::should_try_next_endpoint_for_response(
@@ -666,5 +667,13 @@ mod tests {
             url2,
             "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
         );
+    }
+
+    #[test]
+    fn sanitize_error_truncates_unicode_without_panicking() {
+        let input = "中".repeat(600);
+        let output = sanitize_error_for_log(&input);
+        assert!(output.ends_with("... (truncated)"));
+        assert!(output.is_char_boundary(output.len() - "... (truncated)".len()));
     }
 }
