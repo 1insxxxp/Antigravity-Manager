@@ -1861,11 +1861,8 @@ pub async fn handle_messages(
                 );
                 force_rotate = false;
             } else {
-                force_rotate = record_account_for_rotation(
-                    true,
-                    &account_id,
-                    &mut attempted_account_ids,
-                );
+                force_rotate =
+                    record_account_for_rotation(true, &account_id, &mut attempted_account_ids);
             }
             continue;
         } else {

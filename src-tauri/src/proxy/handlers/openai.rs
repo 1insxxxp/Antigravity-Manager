@@ -1060,11 +1060,8 @@ pub async fn handle_chat_completions(
                 );
                 force_rotate = false;
             } else {
-                force_rotate = record_account_for_rotation(
-                    true,
-                    &account_id,
-                    &mut attempted_account_ids,
-                );
+                force_rotate =
+                    record_account_for_rotation(true, &account_id, &mut attempted_account_ids);
             }
 
             // 2. [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED，允许账号轮换
