@@ -293,6 +293,13 @@ impl UpstreamClient {
             || status.is_server_error()
     }
 
+    fn should_try_next_endpoint_for_response(status: StatusCode, body: &str) -> bool {
+        status == StatusCode::BAD_REQUEST
+            && body
+                .to_ascii_lowercase()
+                .contains("user location is not supported")
+    }
+
     /// Call v1internal API (Basic Method)
     ///
     /// Initiates a basic network request, supporting multi-endpoint auto-fallback.
@@ -454,6 +461,58 @@ impl UpstreamClient {
                             });
                         }
 
+                        // This regional rejection is endpoint-specific rather than an
+                        // account failure. Buffer this rare 400 so we can inspect it,
+                        // fall back precisely, or rebuild the original response.
+                        if status == StatusCode::BAD_REQUEST {
+                            let version = resp.version();
+                            let response_headers = resp.headers().clone();
+                            let response_body = resp
+                                .bytes()
+                                .await
+                                .map_err(|e| format!("Failed to read upstream 400 body: {}", e))?;
+                            let error_text = String::from_utf8_lossy(&response_body);
+
+                            if has_next
+                                && Self::should_try_next_endpoint_for_response(
+                                    status,
+                                    &error_text,
+                                )
+                            {
+                                let err_msg = format!(
+                                    "Upstream {} rejected the request location",
+                                    base_url
+                                );
+                                tracing::warn!(
+                                    "Unsupported location at {} (method={}), trying next endpoint",
+                                    base_url,
+                                    method
+                                );
+                                fallback_attempts.push(FallbackAttemptLog {
+                                    endpoint_url: url.clone(),
+                                    status: Some(status.as_u16()),
+                                    error: err_msg.clone(),
+                                });
+                                last_err = Some(err_msg);
+                                continue;
+                            }
+
+                            let mut rebuilt = axum::http::Response::builder()
+                                .status(status)
+                                .version(version);
+                            *rebuilt
+                                .headers_mut()
+                                .ok_or_else(|| "Failed to rebuild upstream headers".to_string())? =
+                                response_headers;
+                            let rebuilt = rebuilt
+                                .body(response_body)
+                                .map_err(|e| format!("Failed to rebuild upstream response: {}", e))?;
+                            return Ok(UpstreamCallResult {
+                                response: rebuilt.into(),
+                                fallback_attempts,
+                            });
+                        }
+
                         // [NEW] 检测 403 错误 (Issue #3074)
                         // 只要带有项目 Header 且返回 403，我们就尝试降级重试一次
                         if status == StatusCode::FORBIDDEN
@@ -576,6 +635,21 @@ impl UpstreamClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn falls_back_only_for_unsupported_location_bad_request() {
+        let unsupported = r#"{"error":{"code":400,"message":"User location is not supported for the API use."}}"#;
+        let invalid = r#"{"error":{"code":400,"message":"Invalid request body"}}"#;
+
+        assert!(UpstreamClient::should_try_next_endpoint_for_response(
+            StatusCode::BAD_REQUEST,
+            unsupported,
+        ));
+        assert!(!UpstreamClient::should_try_next_endpoint_for_response(
+            StatusCode::BAD_REQUEST,
+            invalid,
+        ));
+    }
 
     #[test]
     fn test_build_url() {

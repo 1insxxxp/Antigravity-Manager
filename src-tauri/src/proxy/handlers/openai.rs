@@ -18,13 +18,14 @@ use crate::proxy::upstream::client::mask_email;
 const MAX_RETRY_ATTEMPTS: usize = 3;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    apply_retry_strategy, determine_retry_strategy, record_account_for_rotation,
+    should_rotate_account_for_error, RetryStrategy,
 };
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
 use crate::proxy::session_manager::SessionManager;
 use axum::http::HeaderMap;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::time::Duration;
 
 /// Return true only when a streamed chunk contains an actual error event.
@@ -387,6 +388,7 @@ pub async fn handle_chat_completions(
     let debug_cfg = state.debug_logging.read().await.clone();
 
     let mut force_rotate = false;
+    let mut attempted_account_ids = HashSet::new();
 
     if debug_logger::is_enabled(&debug_cfg) {
         if let Some(ledger) = normalized_interaction_ledger {
@@ -508,11 +510,12 @@ pub async fn handle_chat_completions(
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 Some(&session_id),
                 &mapped_model,
+                &attempted_account_ids,
             )
             .await
         {
@@ -1050,14 +1053,18 @@ pub async fn handle_chat_completions(
             }
 
             // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
+            if !should_rotate_account_for_error(status_code, Some(&strategy), &error_text) {
                 debug!(
                     "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
                     trace_id, status_code
                 );
                 force_rotate = false;
             } else {
-                force_rotate = true;
+                force_rotate = record_account_for_rotation(
+                    true,
+                    &account_id,
+                    &mut attempted_account_ids,
+                );
             }
 
             // 2. [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED，允许账号轮换
@@ -2148,6 +2155,7 @@ pub async fn handle_completions(
     }
 
     let mut force_rotate = false;
+    let mut attempted_account_ids = HashSet::new();
 
     for attempt in 0..max_attempts {
         // 3. 模型配置解析
@@ -2172,11 +2180,12 @@ pub async fn handle_completions(
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &mapped_model,
+                &attempted_account_ids,
             )
             .await
         {
@@ -2908,7 +2917,11 @@ pub async fn handle_completions(
         )
         .await
         {
-            // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
+            force_rotate = record_account_for_rotation(
+                should_rotate_account_for_error(status_code, Some(&strategy), &error_text),
+                &account_id,
+                &mut attempted_account_ids,
+            );
             continue;
         } else {
             // 不可重试

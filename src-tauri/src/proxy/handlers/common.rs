@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info};
 
@@ -33,6 +34,12 @@ pub fn determine_retry_strategy(
     retried_without_thinking: bool,
 ) -> RetryStrategy {
     match status_code {
+        // Google Cloud Code may reject an otherwise valid account on one regional edge.
+        // Rotate promptly so another account can be selected.
+        400 if is_unsupported_location_error(error_text) => {
+            RetryStrategy::FixedDelay(Duration::from_millis(200))
+        }
+
         // 400 错误：仅在特定 Thinking 签名失败时重试一次
         400 if !retried_without_thinking
             && (error_text.contains("Invalid `signature`")
@@ -217,11 +224,21 @@ pub fn should_rotate_account_for_error(
     strategy: Option<&RetryStrategy>,
     error_text: &str,
 ) -> bool {
+    if status_code == 400 && is_unsupported_location_error(error_text) {
+        return true;
+    }
+
     if status_code == 503 && is_model_capacity_error(error_text) {
         return true;
     }
 
     should_rotate_account(status_code, strategy)
+}
+
+fn is_unsupported_location_error(error_text: &str) -> bool {
+    error_text
+        .to_ascii_lowercase()
+        .contains("user location is not supported")
 }
 
 pub fn exhausted_response_status(last_status: Option<StatusCode>, last_error: &str) -> StatusCode {
@@ -232,9 +249,41 @@ pub fn exhausted_response_status(last_status: Option<StatusCode>, last_error: &s
     }
 }
 
+/// Track accounts that must not be selected again during the same request.
+pub fn record_account_for_rotation(
+    should_rotate: bool,
+    account_id: &str,
+    attempted_account_ids: &mut HashSet<String>,
+) -> bool {
+    if should_rotate {
+        attempted_account_ids.insert(account_id.to_string());
+    }
+    should_rotate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn records_only_accounts_that_must_rotate() {
+        let mut attempted_account_ids = HashSet::new();
+
+        assert!(record_account_for_rotation(
+            true,
+            "failed-account",
+            &mut attempted_account_ids,
+        ));
+        assert!(attempted_account_ids.contains("failed-account"));
+
+        assert!(!record_account_for_rotation(
+            false,
+            "retry-same-account",
+            &mut attempted_account_ids,
+        ));
+        assert!(!attempted_account_ids.contains("retry-same-account"));
+    }
 
     #[test]
     fn rotates_account_for_structured_model_capacity_503() {
@@ -273,6 +322,28 @@ mod tests {
             }
             strategy => panic!("unexpected retry strategy: {strategy:?}"),
         }
+    }
+
+    #[test]
+    fn retries_and_rotates_for_unsupported_location() {
+        let error = r#"{"error":{"code":400,"message":"User location is not supported for the API use.","status":"FAILED_PRECONDITION"}}"#;
+
+        assert!(matches!(
+            determine_retry_strategy(400, error, false),
+            RetryStrategy::FixedDelay(_)
+        ));
+        assert!(should_rotate_account_for_error(400, None, error));
+    }
+
+    #[test]
+    fn does_not_retry_unrelated_bad_request() {
+        let error = r#"{"error":{"code":400,"status":"INVALID_ARGUMENT"}}"#;
+
+        assert!(matches!(
+            determine_retry_strategy(400, error, false),
+            RetryStrategy::NoRetry
+        ));
+        assert!(!should_rotate_account_for_error(400, None, error));
     }
 
     #[test]

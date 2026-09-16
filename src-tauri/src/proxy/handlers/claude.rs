@@ -9,6 +9,7 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tokio::time::Duration;
 use tracing::{debug, error, info};
 
@@ -292,7 +293,8 @@ The structure MUST be as follows:
 // ===== 统一退避策略模块 =====
 // 移除本地重复定义，使用 common 中的统一实现
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    apply_retry_strategy, determine_retry_strategy, record_account_for_rotation,
+    should_rotate_account_for_error, RetryStrategy,
 };
 
 // ===== 退避策略模块结束 =====
@@ -861,6 +863,7 @@ pub async fn handle_messages(
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
+    let mut attempted_account_ids = HashSet::new();
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -894,11 +897,12 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_excluding(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &config.final_model,
+                &attempted_account_ids,
             )
             .await
         {
@@ -1850,14 +1854,18 @@ pub async fn handle_messages(
         .await
         {
             // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&retry_strategy)) {
+            if !should_rotate_account_for_error(status_code, Some(&retry_strategy), &error_text) {
                 debug!(
                     "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
                     trace_id, status_code
                 );
                 force_rotate = false;
             } else {
-                force_rotate = true;
+                force_rotate = record_account_for_rotation(
+                    true,
+                    &account_id,
+                    &mut attempted_account_ids,
+                );
             }
             continue;
         } else {
